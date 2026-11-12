@@ -134,6 +134,10 @@ abi3t = ["pyo3-ffi/abi3t"]
 # With abi3t, we can manually set the minimum Python version.
 abi3t-py315 = ["abi3t", "pyo3-ffi/abi3t-py315"]
 
+# Fail the build if `PYO3_CONFIG_FILE` is not set, instead of falling back to
+# detecting an interpreter on the host system.
+require-config-file = ["pyo3-ffi/require-config-file"]
+
 # deprecated: no longer needed, raw-dylib is used instead
 generate-import-lib = ["pyo3-ffi/generate-import-lib"]
 

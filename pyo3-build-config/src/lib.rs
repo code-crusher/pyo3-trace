@@ -204,15 +204,35 @@ pub mod pyo3_build_script_impl {
         pub source: BuildConfigSource,
     }
 
+    /// Fails if a config file is required but was not provided.
+    ///
+    /// `required` is normally `cfg!(feature = "require-config-file")`; it is a parameter so that
+    /// both behaviors can be tested without rebuilding this crate.
+    pub(crate) fn ensure_config_file_present(
+        config_file_present: bool,
+        required: bool,
+    ) -> Result<()> {
+        if required && !config_file_present {
+            return Err(concat!(
+                "the `require-config-file` feature is enabled, but the `PYO3_CONFIG_FILE` environment variable is not set\n",
+                "= help: set `PYO3_CONFIG_FILE` to the absolute path of a PyO3 config file\n",
+                "= help: note that Cargo only reads `.cargo/config.toml` from the current working directory, so it is ignored when building with `--manifest-path`; see https://github.com/rust-lang/cargo/issues/2930",
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     /// Gets the configuration for use from `pyo3-ffi`'s build script.
     pub fn resolve_build_config(target: &Triple) -> Result<BuildConfig> {
-        #[allow(
-            clippy::const_is_empty,
-            reason = "CONFIG_FILE is generated in build.rs, content can vary"
-        )]
-        if let Some(interpreter_config) =
-            InterpreterConfig::from_pyo3_config_file_env(target).transpose()?
-        {
+        let config_file = InterpreterConfig::from_pyo3_config_file_env(target).transpose()?;
+
+        // When the `require-config-file` feature is enabled, fail loudly instead of falling back
+        // to an interpreter detected on the host system. This lets a crate pin PyO3 to a config
+        // file from its own `Cargo.toml`, which is reliable regardless of the working directory.
+        ensure_config_file_present(config_file.is_some(), cfg!(feature = "require-config-file"))?;
+
+        if let Some(interpreter_config) = config_file {
             Ok(BuildConfig {
                 interpreter_config,
                 source: BuildConfigSource::ConfigFile,
@@ -460,5 +480,33 @@ mod tests {
         }
 
         assert_eq!(get_inner(), interpreter_config);
+    }
+
+    #[test]
+    fn test_ensure_config_file_present() {
+        use pyo3_build_script_impl::ensure_config_file_present;
+
+        // Config file present: always fine.
+        assert!(ensure_config_file_present(true, true).is_ok());
+        assert!(ensure_config_file_present(true, false).is_ok());
+
+        // Config file absent but not required: fall back as before.
+        assert!(ensure_config_file_present(false, false).is_ok());
+
+        // Config file absent and required: hard error with actionable help.
+        let error = ensure_config_file_present(false, true).unwrap_err();
+        let report = error.report().to_string();
+        assert!(
+            report.contains("`PYO3_CONFIG_FILE` environment variable is not set"),
+            "{report}"
+        );
+        assert!(
+            report.contains("= help: set `PYO3_CONFIG_FILE`"),
+            "{report}"
+        );
+        assert!(
+            report.contains("https://github.com/rust-lang/cargo/issues/2930"),
+            "{report}"
+        );
     }
 }

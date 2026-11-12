@@ -36,6 +36,10 @@ abi3-py315 = ["abi3"]
 
 abi3t-py315 = ["abi3t"]
 
+# Fail the build if `PYO3_CONFIG_FILE` is not set, instead of falling back to
+# detecting an interpreter on the host system.
+require-config-file = ["pyo3-build-config/require-config-file"]
+
 # deprecated
 extension-module = ["pyo3-build-config/extension-module"]
 generate-import-lib = ["pyo3-build-config/generate-import-lib"]

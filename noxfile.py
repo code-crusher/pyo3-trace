@@ -1446,6 +1446,31 @@ def test_version_limits(session: nox.Session):
         config_file.set("CPython", "3.14")
         _run_cargo(session, "check", "--features=pyo3/abi3t,pyo3/abi3", env=env)
 
+        # `require-config-file` should build while PYO3_CONFIG_FILE is set
+        _run_cargo(
+            session, "check", "--features=pyo3/require-config-file", env=env
+        )
+
+    # ... but should fail if PYO3_CONFIG_FILE is missing, rather than silently
+    # falling back to an interpreter detected on the host system
+    env = os.environ.copy()
+    env.pop("PYO3_CONFIG_FILE", None)
+    env["PYO3_NO_PYTHON"] = "1"  # ensure no interpreter fallback could succeed
+    with tempfile.TemporaryFile() as stderr:
+        _run_cargo(
+            session,
+            "check",
+            "--features=pyo3/require-config-file",
+            env=env,
+            stderr=stderr,
+            expect_error=True,
+        )
+        stderr.seek(0)
+        stderr = stderr.read().decode()
+    assert "`PYO3_CONFIG_FILE` environment variable is not set" in stderr, (
+        f"Expected the require-config-file error, got: \n\n{stderr}"
+    )
+
     # attempt to build with latest version and check that abi3 version
     # configured matches the feature
     max_minor_version = max(int(v.split(".")[1]) for v in ABI3_PY_VERSIONS)
@@ -1657,6 +1682,7 @@ def check_feature_powerset(session: nox.Session):
         "default",
         "auto-initialize",
         "generate-import-lib",
+        "require-config-file",  # would fail unless PYO3_CONFIG_FILE is set
         "multiple-pymethods",  # Because it's not supported on wasm
     }
 

@@ -17,6 +17,10 @@ target-lexicon = "0.13.3"
 [features]
 default = []
 
+# Fail the build if `PYO3_CONFIG_FILE` is not set, instead of falling back to
+# detecting an interpreter on the host system.
+require-config-file = []
+
 # deprecated
 resolve-config = []
 extension-module = []

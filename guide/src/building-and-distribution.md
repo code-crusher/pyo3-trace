@@ -86,6 +86,24 @@ If you save the above output config from `PYO3_PRINT_CONFIG` to a file, it is po
 If your build environment is unusual enough that PyO3's regular configuration detection doesn't work, using a config file like this will give you the flexibility to make PyO3 work for you.
 To see the full set of options supported, see the documentation for the [`InterpreterConfig` struct](https://docs.rs/pyo3-build-config/{{#PYO3_DOCS_VERSION}}/pyo3_build_config/struct.InterpreterConfig.html).
 
+#### Requiring a config file
+
+When `PYO3_CONFIG_FILE` is not set, PyO3 falls back to detecting an interpreter on the host system.
+If that interpreter does not match the Python which your program actually links against, the build can produce binaries with mismatched ABI details, which may crash at runtime in hard-to-debug ways.
+
+To make a missing `PYO3_CONFIG_FILE` a hard error instead, enable the `require-config-file` feature on `pyo3` (or `pyo3-ffi`):
+
+```toml
+[dependencies]
+pyo3 = { version = "{{#PYO3_CRATE_VERSION}}", features = ["require-config-file"] }
+```
+
+The build will then fail with an error if `PYO3_CONFIG_FILE` is not set.
+
+Prefer enabling this feature in your crate's `Cargo.toml` rather than setting `PYO3_CONFIG_FILE` from `.cargo/config.toml`.
+Cargo only reads `.cargo/config.toml` relative to the *current working directory*, not the crate or workspace directory, so a config file set there is silently ignored when building with `--manifest-path` (see [rust-lang/cargo#2930](https://github.com/rust-lang/cargo/issues/2930)).
+Setting the feature in `Cargo.toml` is reliable regardless of where `cargo` is invoked from.
+
 ## Building Python extension modules
 
 Python extension modules need to be compiled differently depending on the OS (and architecture) that they are being compiled for.

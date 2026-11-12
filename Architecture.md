@@ -149,6 +149,8 @@ Some of the functionality of `pyo3-build-config`:
   - If the interpreter is PyPy, we set `#[cfg(PyPy)`.
   - If the `PYO3_CONFIG_FILE` environment variable is set then that file's contents will be used
     instead of any detected configuration.
+  - If the `require-config-file` feature is enabled and `PYO3_CONFIG_FILE` is not set, the build
+    fails instead of falling back to a detected interpreter.
   - If the `PYO3_NO_PYTHON` environment variable is set then the interpreter detection is bypassed
     entirely and only abi3 extensions can be built.
 - Check if we are building a Python extension.

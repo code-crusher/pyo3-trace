@@ -108,6 +108,15 @@ This feature was introduced to ease migration.
 It was found that delayed reference counting (which PyO3 used historically) could not be made sound and hence `Clone`-ing an instance of `Py<T>` is impossible when not attached to Python interpreter (it will panic).
 To avoid migrations introducing new panics without warning, the `Clone` implementation itself is now gated behind this feature.
 
+### `require-config-file`
+
+Makes the build fail if the `PYO3_CONFIG_FILE` environment variable is not set, rather than falling back to detecting an interpreter on the host system.
+
+This is useful when the Python which the program links against is configured explicitly through a PyO3 config file.
+Enabling the feature in `Cargo.toml` is reliable regardless of the working directory, unlike setting `PYO3_CONFIG_FILE` from `.cargo/config.toml` (which Cargo ignores when building with `--manifest-path`).
+
+See the [building and distribution](building-and-distribution.md#requiring-a-config-file) section for further detail.
+
 ### `pyo3_disable_reference_pool`
 
 This is a performance-oriented conditional compilation flag, e.g. [set via `$RUSTFLAGS`][set-configuration-options], which disabled the global reference pool and the associated overhead for the crossing the Python-Rust boundary.
