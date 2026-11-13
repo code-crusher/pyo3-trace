@@ -355,3 +355,43 @@ fn test_generic_output_type() {
         "builtins.str"
     );
 }
+
+#[cfg(feature = "experimental-inspect")]
+#[test]
+fn test_recursive_output_type() {
+    // Recursive types cannot expand the field type hints, as that would make `OUTPUT_TYPE`
+    // refer to itself. See https://github.com/PyO3/pyo3/issues/6509.
+    #[derive(IntoPyObject, IntoPyObjectRef)]
+    #[allow(dead_code)]
+    enum Recursive {
+        Int(i64),
+        List(Vec<Recursive>),
+    }
+
+    #[derive(IntoPyObject)]
+    struct RecursiveStruct {
+        children: Vec<RecursiveStruct>,
+    }
+
+    #[derive(IntoPyObject)]
+    struct RecursiveNamed {
+        next: Option<Vec<RecursiveNamed>>,
+    }
+
+    assert_eq!(
+        <Recursive as IntoPyObject<'_>>::OUTPUT_TYPE.to_string(),
+        "builtins.int | _typeshed.Incomplete"
+    );
+    assert_eq!(
+        <&Recursive as IntoPyObject<'_>>::OUTPUT_TYPE.to_string(),
+        "builtins.int | _typeshed.Incomplete"
+    );
+    assert_eq!(
+        <RecursiveStruct as IntoPyObject<'_>>::OUTPUT_TYPE.to_string(),
+        "dict[str, _typeshed.Incomplete]"
+    );
+    assert_eq!(
+        <RecursiveNamed as IntoPyObject<'_>>::OUTPUT_TYPE.to_string(),
+        "dict[str, _typeshed.Incomplete]"
+    );
+}

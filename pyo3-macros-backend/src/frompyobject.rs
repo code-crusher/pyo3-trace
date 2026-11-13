@@ -100,10 +100,10 @@ impl<'a> Enum<'a> {
     }
 
     #[cfg(feature = "experimental-inspect")]
-    fn input_type(&self) -> PyExpr {
+    fn input_type(&self, self_ident: &Ident) -> PyExpr {
         self.variants
             .iter()
-            .map(|var| var.input_type())
+            .map(|var| var.input_type(self_ident))
             .reduce(PyExpr::union)
             .expect("Empty enum")
     }
@@ -457,18 +457,18 @@ impl<'a> Container<'a> {
     }
 
     #[cfg(feature = "experimental-inspect")]
-    fn input_type(&self) -> PyExpr {
+    fn input_type(&self, self_ident: &Ident) -> PyExpr {
         match &self.ty {
             ContainerType::StructNewtype(_, from_py_with, ty) => {
-                Self::field_input_type(from_py_with, ty)
+                Self::field_input_type(from_py_with, ty, self_ident)
             }
             ContainerType::TupleNewtype(from_py_with, ty) => {
-                Self::field_input_type(from_py_with, ty)
+                Self::field_input_type(from_py_with, ty, self_ident)
             }
             ContainerType::Tuple(tups) => PyExpr::subscript(
                 PyExpr::builtin("tuple"),
                 PyExpr::tuple(tups.iter().map(|TupleStructField { from_py_with, ty }| {
-                    Self::field_input_type(from_py_with, ty)
+                    Self::field_input_type(from_py_with, ty, self_ident)
                 })),
             ),
             ContainerType::Struct(_) => {
@@ -479,9 +479,17 @@ impl<'a> Container<'a> {
     }
 
     #[cfg(feature = "experimental-inspect")]
-    fn field_input_type(from_py_with: &Option<FromPyWithAttribute>, ty: &syn::Type) -> PyExpr {
+    fn field_input_type(
+        from_py_with: &Option<FromPyWithAttribute>,
+        ty: &syn::Type,
+        self_ident: &Ident,
+    ) -> PyExpr {
         if from_py_with.is_some() {
             // We don't know what from_py_with is doing
+            PyExpr::module_attr("_typeshed", "Incomplete")
+        } else if utils::type_mentions(ty, self_ident) {
+            // Expanding the field's type hint would refer back to `Self::INPUT_TYPE`, which
+            // `rustc` rejects as a cycle when evaluating the constant.
             PyExpr::module_attr("_typeshed", "Incomplete")
         } else {
             PyExpr::from_from_py_object(ty.clone(), None)
@@ -555,11 +563,12 @@ pub fn build_derive_from_pyobject(tokens: &DeriveInput) -> Result<TokenStream> {
     #[cfg(feature = "experimental-inspect")]
     let input_type = {
         let pyo3_crate_path = &ctx.pyo3_path;
+        let self_ident = &tokens.ident;
         let input_type = match &tokens.data {
-            syn::Data::Enum(en) => Enum::new(en, &tokens.ident, options)?.input_type(),
+            syn::Data::Enum(en) => Enum::new(en, self_ident, options)?.input_type(self_ident),
             syn::Data::Struct(st) => {
-                let ident = &tokens.ident;
-                Container::new(&st.fields, parse_quote!(#ident), options.clone())?.input_type()
+                Container::new(&st.fields, parse_quote!(#self_ident), options.clone())?
+                    .input_type(self_ident)
             }
             syn::Data::Union(_) => {
                 // Not supported at this point

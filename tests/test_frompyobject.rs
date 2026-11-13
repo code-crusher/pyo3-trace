@@ -961,3 +961,21 @@ fn test_generic_input_type() {
         "builtins.str | tuple[builtins.str, builtins.str]"
     );
 }
+
+#[cfg(feature = "experimental-inspect")]
+#[test]
+fn test_recursive_input_type() {
+    // Recursive types cannot expand the field type hints, as that would make `INPUT_TYPE`
+    // refer to itself. See https://github.com/PyO3/pyo3/issues/6509.
+    #[derive(FromPyObject)]
+    #[allow(dead_code)]
+    enum Recursive {
+        Int(i64),
+        List(Vec<Recursive>),
+    }
+
+    assert_eq!(
+        <Recursive as FromPyObject<'_, '_>>::INPUT_TYPE.to_string(),
+        "typing.SupportsIndex | _typeshed.Incomplete"
+    );
+}

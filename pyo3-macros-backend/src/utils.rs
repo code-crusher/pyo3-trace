@@ -376,6 +376,39 @@ pub(crate) fn locate_tokens_at(tokens: TokenStream, span: Span) -> TokenStream {
     set_span_recursively(tokens, output_span)
 }
 
+/// Returns whether `ty` mentions the type `ident`, or `Self`.
+///
+/// This is used to detect recursive types: their type hint cannot be derived by expanding the
+/// field type hints, because that would generate a constant referring to itself.
+///
+/// Matching on the last path segment means a type with the same name from another module is
+/// treated as recursive too. That is conservative, but only costs a less precise type hint.
+#[cfg(feature = "experimental-inspect")]
+pub(crate) fn type_mentions(ty: &syn::Type, ident: &syn::Ident) -> bool {
+    struct MentionsVisitor<'a> {
+        ident: &'a syn::Ident,
+        found: bool,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for MentionsVisitor<'_> {
+        fn visit_path(&mut self, path: &'ast syn::Path) {
+            if let Some(segment) = path.segments.last() {
+                if segment.ident == *self.ident || segment.ident == "Self" {
+                    self.found = true;
+                }
+            }
+            syn::visit::visit_path(self, path);
+        }
+    }
+
+    let mut visitor = MentionsVisitor {
+        ident,
+        found: false,
+    };
+    syn::visit::visit_type(&mut visitor, ty);
+    visitor.found
+}
+
 /// Replaces all explicit lifetimes in `self` with elided (`'_`) lifetimes
 ///
 /// This is useful if `Self` is used in `const` context, where explicit

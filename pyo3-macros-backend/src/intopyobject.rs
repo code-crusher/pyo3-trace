@@ -363,10 +363,10 @@ impl<'a, const REF: bool> Container<'a, REF> {
     }
 
     #[cfg(feature = "experimental-inspect")]
-    fn output_type(&self) -> PyExpr {
+    fn output_type(&self, self_ident: &Ident) -> PyExpr {
         match &self.ty {
             ContainerType::StructNewtype(field) | ContainerType::TupleNewtype(field) => {
-                Self::field_output_type(&None, &field.ty)
+                Self::field_output_type(&None, &field.ty, self_ident)
             }
             ContainerType::Tuple(tups) => PyExpr::subscript(
                 PyExpr::builtin("tuple"),
@@ -374,7 +374,9 @@ impl<'a, const REF: bool> Container<'a, REF> {
                     |TupleStructField {
                          into_py_with,
                          field,
-                     }| { Self::field_output_type(into_py_with, &field.ty) },
+                     }| {
+                        Self::field_output_type(into_py_with, &field.ty, self_ident)
+                    },
                 )),
             ),
             ContainerType::Struct(fields) => {
@@ -386,7 +388,7 @@ impl<'a, const REF: bool> Container<'a, REF> {
                     .expect("Structs have at least one field");
                 let value_type = fields
                     .iter()
-                    .map(|f| Self::field_output_type(&f.into_py_with, &f.field.ty))
+                    .map(|f| Self::field_output_type(&f.into_py_with, &f.field.ty, self_ident))
                     .reduce(PyExpr::union)
                     .expect("Structs have at least one field");
                 PyExpr::subscript(
@@ -412,9 +414,17 @@ impl<'a, const REF: bool> Container<'a, REF> {
     }
 
     #[cfg(feature = "experimental-inspect")]
-    fn field_output_type(into_py_with: &Option<IntoPyWithAttribute>, ty: &syn::Type) -> PyExpr {
+    fn field_output_type(
+        into_py_with: &Option<IntoPyWithAttribute>,
+        ty: &syn::Type,
+        self_ident: &Ident,
+    ) -> PyExpr {
         if into_py_with.is_some() {
             // We don't know what into_py_with is doing
+            PyExpr::module_attr("_typeshed", "Incomplete")
+        } else if utils::type_mentions(ty, self_ident) {
+            // Expanding the field's type hint would refer back to `Self::OUTPUT_TYPE`, which
+            // `rustc` rejects as a cycle when evaluating the constant.
             PyExpr::module_attr("_typeshed", "Incomplete")
         } else if REF {
             PyExpr::from_into_py_object(parse_quote!(&#ty), None)
@@ -499,10 +509,10 @@ impl<'a, const REF: bool> Enum<'a, REF> {
     }
 
     #[cfg(feature = "experimental-inspect")]
-    fn output_type(&self) -> PyExpr {
+    fn output_type(&self, self_ident: &Ident) -> PyExpr {
         self.variants
             .iter()
-            .map(|var| var.output_type())
+            .map(|var| var.output_type(self_ident))
             .reduce(PyExpr::union)
             .expect("Empty enum")
     }
@@ -601,18 +611,16 @@ pub fn build_derive_into_pyobject<const REF: bool>(tokens: &DeriveInput) -> Resu
     #[cfg(feature = "experimental-inspect")]
     let output_type = {
         let pyo3_crate_path = &ctx.pyo3_path;
+        let self_ident = &tokens.ident;
         let output_type = match &tokens.data {
-            syn::Data::Enum(en) => Enum::<REF>::new(en, &tokens.ident)?.output_type(),
-            syn::Data::Struct(st) => {
-                let ident = &tokens.ident;
-                Container::<REF>::new(
-                    Some(Ident::new("self", Span::call_site())),
-                    &st.fields,
-                    parse_quote!(#ident),
-                    options,
-                )?
-                .output_type()
-            }
+            syn::Data::Enum(en) => Enum::<REF>::new(en, self_ident)?.output_type(self_ident),
+            syn::Data::Struct(st) => Container::<REF>::new(
+                Some(Ident::new("self", Span::call_site())),
+                &st.fields,
+                parse_quote!(#self_ident),
+                options,
+            )?
+            .output_type(self_ident),
             syn::Data::Union(_) => {
                 // Not supported at this point
                 PyExpr::module_attr("_typeshed", "Incomplete")
