@@ -26,7 +26,12 @@ Source = "https://github.com/PyO3/pyo3/tree/main/pyo3-introspection"
 Tracker = "https://github.com/PyO3/pyo3/issues"
 
 [build-system]
-requires = ["maturin>=1,<2"]
+# `license-files` are relative to the root of the sdist, which is also where the
+# `License-File` entries in `PKG-INFO` point. maturin only started copying the
+# matched files there in 1.9.3; older releases left them next to this file
+# (i.e. under `pyo3-introspection/`), which PyPI rejects on upload.
+# See https://github.com/PyO3/pyo3/issues/6303.
+requires = ["maturin>=1.9.3,<2"]
 build-backend = "maturin"
 
 [tool.maturin]

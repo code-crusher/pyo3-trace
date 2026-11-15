@@ -1820,6 +1820,49 @@ def test_introspection(session: nox.Session):
         # The stubs only match a module built with the features used above, so this test
         # is skipped by the regular `pytests` session and runs here instead.
         _run(session, "pytest", "pytests/tests/test_stubs.py")
+        _check_introspection_sdist(session, Path(stub_dir))
+
+
+def _check_introspection_sdist(session: nox.Session, work_dir: Path) -> None:
+    """Checks that the `pyo3-introspection` sdist can be uploaded to PyPI.
+
+    PyPI rejects an upload when a `License-File` entry in `PKG-INFO` does not
+    name a file at the root of the sdist, which is what used to happen when
+    maturin copied `license-files` next to `pyproject.toml` instead. `twine
+    check` does not catch this, so check the invariant directly.
+    """
+    dist_dir = work_dir / "sdist"
+    _run(
+        session,
+        "maturin",
+        "sdist",
+        "--manifest-path",
+        str(PYO3_DIR / "pyo3-introspection" / "Cargo.toml"),
+        "--out",
+        str(dist_dir),
+    )
+    (sdist,) = dist_dir.glob("*.tar.gz")
+    with tarfile.open(sdist) as tar:
+        names = set(tar.getnames())
+        pkg_info = tar.extractfile(
+            next(name for name in names if name.endswith("/PKG-INFO"))
+        ).read()
+    root = sdist.name.removesuffix(".tar.gz")
+    license_files = [
+        line.split(":", 1)[1].strip()
+        for line in pkg_info.decode().splitlines()
+        if line.startswith("License-File:")
+    ]
+    assert license_files, f"no `License-File` metadata in {sdist}"
+    missing = [
+        license_file
+        for license_file in license_files
+        if f"{root}/{license_file}" not in names
+    ]
+    assert not missing, (
+        f"{sdist} declares `License-File` entries which are missing from the "
+        f"root of the sdist: {missing}"
+    )
 
 
 def _introspection_library_variants(
