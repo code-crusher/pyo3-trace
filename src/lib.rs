@@ -418,6 +418,8 @@ mod platform;
 #[doc(hidden)]
 pub mod impl_;
 
+pub mod allocator;
+
 pub mod buffer;
 pub mod call;
 pub mod conversion;

@@ -161,6 +161,30 @@ For maximum performance prefer using Rust tuples as arguments.
 [`tp_call`]: https://docs.python.org/3/c-api/call.html#the-tp-call-protocol
 [`vectorcall`]: https://docs.python.org/3/c-api/call.html#the-vectorcall-protocol
 
+## Use Python's allocator for Rust allocations
+
+By default, Rust code allocates memory through the system allocator.
+On the free-threaded build of CPython the Python runtime uses its own allocator, tuned for multithreaded workloads, which can scale better under contention than the system allocator.
+If an extension module performs a lot of allocation off of Python objects, the system allocator can become a bottleneck.
+
+PyO3 provides a drop-in [`GlobalAlloc`] implementation in [`pyo3::allocator::PyMemAllocator`][PyMemAllocator] that routes Rust allocations through Python's raw memory allocator (the `PyMem_Raw*` API).
+Enabling it is opt-in per binary and is as simple as registering it as the `#[global_allocator]`:
+
+```rust,ignore
+use pyo3::allocator::PyMemAllocator;
+
+#[global_allocator]
+static GLOBAL: PyMemAllocator = PyMemAllocator;
+```
+
+This should only be done in the final binary or extension module, not in libraries that may be linked into multiple binaries, since a binary can only have one global allocator.
+
+This also makes Rust-side allocations visible to [`tracemalloc`](https://docs.python.org/3/library/tracemalloc.html), which can be useful for tracking where memory is being used.
+However, `tracemalloc` hooks may call back into the Python runtime on whichever thread performed the allocation, so allocation on threads that are not attached to the interpreter (for example, threads blocked in [`Python::detach`]) may attach to the interpreter implicitly and should be designed with that in mind.
+
+[`GlobalAlloc`]: {{#PYO3_DOCS_URL}}/std/alloc/trait.GlobalAlloc.html
+[PyMemAllocator]: {{#PYO3_DOCS_URL}}/pyo3/allocator/struct.PyMemAllocator.html
+
 ## Detach from the interpreter for long-running Rust-only work
 
 When executing Rust code which does not need to interact with the Python interpreter, use [`Python::detach`] to allow the Python interpreter to proceed without waiting for the current thread.

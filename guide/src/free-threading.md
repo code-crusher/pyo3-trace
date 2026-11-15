@@ -232,6 +232,12 @@ Python::attach(|py| {
 });
 ```
 
+### Allocators under free-threading
+
+Under the free-threaded build, the default system allocator can become a contention point for code that allocates frequently from many threads.
+PyO3 provides an opt-in `GlobalAlloc` implementation, [`pyo3::allocator::PyMemAllocator`], which routes Rust allocations through Python's own raw memory allocator, which is designed to handle concurrent allocation.
+See the [performance section](performance.md#use-pythons-allocator-for-rust-allocations) for details and caveats.
+
 ### `GILProtected` has been removed
 
 [`GILProtected`] was a PyO3 type that allowed mutable access to static data by leveraging the GIL to lock concurrent access from other threads.
@@ -306,3 +312,4 @@ This ensures that global synchronization events started by the Python runtime ca
 [`Python<'py>`]: {{#PYO3_DOCS_URL}}/pyo3/marker/struct.Python.html
 [`PyOnceLock`]: {{#PYO3_DOCS_URL}}/pyo3/sync/struct.PyOnceLock.html
 [`threading`]: https://docs.python.org/3/library/threading.html
+[`pyo3::allocator::PyMemAllocator`]: {{#PYO3_DOCS_URL}}/pyo3/allocator/struct.PyMemAllocator.html

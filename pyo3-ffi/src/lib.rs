@@ -481,6 +481,8 @@ pub use self::pyframe::*;
 pub use self::pyhash::*;
 pub use self::pylifecycle::*;
 pub use self::pymem::*;
+#[cfg(all(any(not(Py_LIMITED_API), Py_3_13), not(RustPython)))]
+pub use self::pymem_raw::*;
 pub use self::pyport::*;
 pub use self::pystate::*;
 pub use self::pystrtod::*;
@@ -569,6 +571,8 @@ mod pylifecycle;
 // skipped pymacro.h
 // skipped pymath.h
 mod pymem;
+#[cfg(all(any(not(Py_LIMITED_API), Py_3_13), not(RustPython)))]
+mod pymem_raw;
 mod pyport;
 mod pystate;
 // skipped pystats.h
