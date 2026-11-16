@@ -40,6 +40,13 @@ impl PyCallbackOutput for ffi::Py_ssize_t {
 }
 
 /// Convert the result of callback function into the appropriate return value.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` cannot be converted to a Python object",
+    note = "`IntoPyCallbackOutput` is implemented for all types that implement `IntoPyObject`",
+    note = "`IntoPyObject` is automatically implemented by the `#[pyclass]` macro",
+    note = "`PyClassInitializer` is necessary to construct `#[pyclass(extends = ...)]` types",
+    note = "if you do not own `{Self}` you can perform a manual conversion to one of the types in `pyo3::types::*`"
+)]
 pub trait IntoPyCallbackOutput<'py, Target>: into_py_callback_output::Sealed<'py, Target> {
     fn convert(self, py: Python<'py>) -> PyResult<Target>;
 }

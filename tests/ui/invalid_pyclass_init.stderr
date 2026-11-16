@@ -1,9 +1,13 @@
-error[E0277]: the trait bound `i32: pyo3::impl_::callback::IntoPyCallbackOutput<'_, i32>` is not satisfied
+error[E0277]: `i32` cannot be converted to a Python object
    --> tests/ui/invalid_pyclass_init.rs:8:27
     |
   8 |     fn __init__(&self) -> i32 {
     |                           ^^^ the trait `pyo3::impl_::callback::IntoPyCallbackOutput<'_, i32>` is not implemented for `i32`
     |
+    = note: `IntoPyCallbackOutput` is implemented for all types that implement `IntoPyObject`
+    = note: `IntoPyObject` is automatically implemented by the `#[pyclass]` macro
+    = note: `PyClassInitializer` is necessary to construct `#[pyclass(extends = ...)]` types
+    = note: if you do not own `i32` you can perform a manual conversion to one of the types in `pyo3::types::*`
 help: `usize` implements trait `pyo3::impl_::callback::IntoPyCallbackOutput<'py, Target>`
  --> src/impl_/callback.rs
   |
