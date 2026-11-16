@@ -2620,11 +2620,25 @@ fn conda_env_interpreter(conda_prefix: &OsStr, windows: bool) -> PathBuf {
 }
 
 fn get_env_interpreter() -> Option<PathBuf> {
-    match (env_var("VIRTUAL_ENV"), env_var("CONDA_PREFIX")) {
-        // Use cfg rather than CARGO_CFG_TARGET_OS because this affects where files are located on the
-        // build host
-        (Some(dir), None) => Some(venv_interpreter(&dir, cfg!(windows))),
-        (None, Some(dir)) => Some(conda_env_interpreter(&dir, cfg!(windows))),
+    env_interpreter_from_parts(
+        env_var("VIRTUAL_ENV"),
+        env_var("CONDA_PREFIX"),
+        cfg!(windows),
+    )
+}
+
+/// Resolves the Python interpreter to use from the `VIRTUAL_ENV` and `CONDA_PREFIX`
+/// environment variables, verifying that the derived interpreter path actually exists.
+fn env_interpreter_from_parts(
+    virtual_env: Option<OsString>,
+    conda_prefix: Option<OsString>,
+    // Use cfg rather than CARGO_CFG_TARGET_OS because this affects where files are located on the
+    // build host
+    windows: bool,
+) -> Option<PathBuf> {
+    let candidate = match (virtual_env, conda_prefix) {
+        (Some(dir), None) => Some(("VIRTUAL_ENV", venv_interpreter(&dir, windows))),
+        (None, Some(dir)) => Some(("CONDA_PREFIX", conda_env_interpreter(&dir, windows))),
         (Some(_), Some(_)) => {
             warn!(
                 "Both VIRTUAL_ENV and CONDA_PREFIX are set. PyO3 will ignore both of these for \
@@ -2633,6 +2647,17 @@ fn get_env_interpreter() -> Option<PathBuf> {
             None
         }
         (None, None) => None,
+    };
+
+    let (var, interpreter) = candidate?;
+    if interpreter.is_file() {
+        Some(interpreter)
+    } else {
+        warn!(
+            "{var} is set but no Python interpreter found at `{}`; ignoring",
+            interpreter.display()
+        );
+        None
     }
 }
 
@@ -4286,6 +4311,85 @@ mod tests {
         assert_eq!(
             conda_env_interpreter(base, false),
             PathBuf::from_iter(&["base", "bin", "python"])
+        );
+    }
+
+    /// Creates a temporary directory which is removed when the returned guard is dropped.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let dir = env::temp_dir().join(format!(
+                "pyo3-build-config-test-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            TempDir(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn test_env_interpreter_ignores_missing_conda_prefix() {
+        let temp_dir = TempDir::new();
+        assert_eq!(
+            env_interpreter_from_parts(
+                None,
+                Some(temp_dir.path().as_os_str().to_owned()),
+                cfg!(windows)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_env_interpreter_ignores_missing_virtual_env() {
+        let temp_dir = TempDir::new();
+        assert_eq!(
+            env_interpreter_from_parts(
+                Some(temp_dir.path().as_os_str().to_owned()),
+                None,
+                cfg!(windows)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_env_interpreter_uses_existing_conda_prefix() {
+        let temp_dir = TempDir::new();
+        let python = temp_dir.path().join("bin").join("python");
+        fs::create_dir_all(python.parent().unwrap()).unwrap();
+        fs::write(&python, b"").unwrap();
+
+        assert_eq!(
+            env_interpreter_from_parts(None, Some(temp_dir.path().as_os_str().to_owned()), false),
+            Some(python)
+        );
+    }
+
+    #[test]
+    fn test_env_interpreter_uses_existing_virtual_env() {
+        let temp_dir = TempDir::new();
+        let python = temp_dir.path().join("bin").join("python");
+        fs::create_dir_all(python.parent().unwrap()).unwrap();
+        fs::write(&python, b"").unwrap();
+
+        assert_eq!(
+            env_interpreter_from_parts(Some(temp_dir.path().as_os_str().to_owned()), None, false),
+            Some(python)
         );
     }
 
