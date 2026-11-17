@@ -161,6 +161,20 @@ pub fn impl_methods(
                             let attrs = get_cfg_attributes(&meth.attrs);
                             extra_fragments.push(quote!(#(#attrs)* #token_stream));
                         }
+                        GeneratedPyMethod::SlotTraitImplAndMethod(
+                            method_name,
+                            token_stream,
+                            MethodAndMethodDef {
+                                associated_method,
+                                method_def,
+                            },
+                        ) => {
+                            implemented_proto_fragments.insert(method_name);
+                            let attrs = get_cfg_attributes(&meth.attrs);
+                            extra_fragments.push(quote!(#(#attrs)* #token_stream));
+                            associated_methods.push(quote!(#(#attrs)* #associated_method));
+                            methods.push(quote!(#(#attrs)* #method_def));
+                        }
                         GeneratedPyMethod::Proto(MethodAndSlotDef {
                             associated_method,
                             slot_def,

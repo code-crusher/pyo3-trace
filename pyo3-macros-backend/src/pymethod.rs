@@ -65,6 +65,12 @@ pub enum GeneratedPyMethod {
     Method(MethodAndMethodDef),
     Proto(MethodAndSlotDef),
     SlotTraitImpl(String, TokenStream),
+    /// A slot fragment together with an additional `tp_methods` entry for the
+    /// same function. Currently used for `__getattr__`: CPython never installs
+    /// a descriptor for it (there is no slot wrapper for `tp_getattro`'s
+    /// fallback), so the only way Python code can look the method up on the
+    /// type is via this entry.
+    SlotTraitImplAndMethod(String, TokenStream, MethodAndMethodDef),
     /// Opaque tokens to be appended to the `impl` block
     Tokens(TokenStream),
 }
@@ -321,7 +327,30 @@ pub fn gen_py_method(
                 }
                 PyMethodProtoKind::SlotFragment(slot_fragment_def) => {
                     let proto = slot_fragment_def.generate_pyproto_fragment(cls, spec, ctx)?;
-                    GeneratedPyMethod::SlotTraitImpl(method.method_name, proto)
+                    if method.method_name == "__getattr__" {
+                        // see https://github.com/PyO3/pyo3/issues/6101
+                        // CPython does not provide a wrapper descriptor for `__getattr__`,
+                        // so without this `tp_methods` entry `getattr(type(obj), "__getattr__")`
+                        // would fail with `AttributeError`. Unlike a method-wrapper descriptor,
+                        // this entry is called directly by Python without a receiver type
+                        // check, so it must use the checked self-conversion policy.
+                        let wrapper_ident = format_ident!("__pymethod_getattr_exposed__");
+                        let method_def = impl_py_method_def_with_policy(
+                            cls,
+                            spec,
+                            spec.get_doc(meth_attrs).as_ref(),
+                            ctx,
+                            SelfConversionPolicy::checked(),
+                            Some(&wrapper_ident),
+                        )?;
+                        GeneratedPyMethod::SlotTraitImplAndMethod(
+                            method.method_name,
+                            proto,
+                            method_def,
+                        )
+                    } else {
+                        GeneratedPyMethod::SlotTraitImpl(method.method_name, proto)
+                    }
                 }
             }
         }
@@ -411,18 +440,43 @@ pub fn impl_py_method_def(
     doc: Option<&PythonDoc>,
     ctx: &Ctx,
 ) -> Result<MethodAndMethodDef> {
+    // SAFETY: Methods in `tp_methods` are dispatched through CPython's
+    // method-wrapper descriptor, which enforces that the receiver is an
+    // instance of the owning type before reaching the C function. The
+    // trusted path is therefore valid.
+    impl_py_method_def_with_policy(
+        cls,
+        spec,
+        doc,
+        ctx,
+        unsafe { SelfConversionPolicy::trusted() },
+        None,
+    )
+}
+
+/// Like [`impl_py_method_def`], but with an explicit wrapper name and
+/// self-conversion policy, for synthetic `tp_methods` entries whose receiver is
+/// not validated by CPython (e.g. the `__getattr__` entry, which is called
+/// directly from Python rather than through a descriptor that checks the
+/// receiver type).
+fn impl_py_method_def_with_policy(
+    cls: &syn::Type,
+    spec: &FnSpec<'_>,
+    doc: Option<&PythonDoc>,
+    ctx: &Ctx,
+    self_conversion: SelfConversionPolicy,
+    wrapper_ident: Option<&syn::Ident>,
+) -> Result<MethodAndMethodDef> {
     let Ctx { pyo3_path, .. } = ctx;
-    let wrapper_ident = format_ident!("__pymethod_{}__", spec.python_name);
+    let wrapper_ident = wrapper_ident
+        .cloned()
+        .unwrap_or_else(|| format_ident!("__pymethod_{}__", spec.python_name));
     let calling_convention = CallingConvention::from_signature(&spec.signature);
     let associated_method = spec.get_wrapper_function(
         &wrapper_ident,
         Some(cls),
         calling_convention,
-        // SAFETY: Methods in `tp_methods` are dispatched through CPython's
-        // method-wrapper descriptor, which enforces that the receiver is an
-        // instance of the owning type before reaching the C function. The
-        // trusted path is therefore valid.
-        unsafe { SelfConversionPolicy::trusted() },
+        self_conversion,
         ClassMethodReceiver::Class,
         ctx,
     )?;

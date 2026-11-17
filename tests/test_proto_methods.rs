@@ -101,15 +101,21 @@ fn test_getattr() {
                 .is_instance_of::<PyAttributeError>(py)
         );
 
-        // Ensure that passing a wrong self type from Python does not cause UB
-        // FIXME __getattr__ cannot be accessed via the type's __getattr__ slot0
-        // wrapper, so this currently raises an AttributeError instead of a TypeError.
-        // py_expect_exception!(
-        //     py,
-        //     example_py,
-        //     "type(example_py).__getattr__(object(), 'test')",
-        //     PyTypeError
-        // );
+        // `__getattr__` can be looked up on the type, just like the slot wrappers
+        // for the other dunder methods.
+        py_run!(
+            py,
+            example_py,
+            "assert type(example_py).__getattr__(example_py, 'special_custom_attr') == 20"
+        );
+
+        // Passing a wrong self type from Python must not cause UB
+        py_expect_exception!(
+            py,
+            example_py,
+            "type(example_py).__getattr__(object(), 'test')",
+            PyTypeError
+        );
     })
 }
 
@@ -649,14 +655,12 @@ fn getattr_doesnt_override_member() {
         py_assert!(py, inst, "inst.a == 8");
 
         // Ensure that passing a wrong self type from Python does not cause UB
-        // FIXME __getattr__ cannot be accessed via the type's __getattr__ slot
-        // wrapper, so this currently raises an AttributeError instead of a TypeError.
-        // py_expect_exception!(
-        //     py,
-        //     inst,
-        //     "type(inst).__getattr__(object(), 'a')",
-        //     PyTypeError
-        // );
+        py_expect_exception!(
+            py,
+            inst,
+            "type(inst).__getattr__(object(), 'a')",
+            PyTypeError
+        );
     });
 }
 
@@ -728,6 +732,26 @@ fn getattr_and_getattribute() {
         py_assert!(py, inst, "inst.lucky == 57");
         py_expect_exception!(py, inst, "inst.error", PyValueError);
         py_expect_exception!(py, inst, "inst.unlucky", PyAttributeError);
+
+        // Both `__getattr__` and `__getattribute__` can be looked up on the type
+        py_run!(
+            py,
+            inst,
+            "assert type(inst).__getattr__(inst, 'lucky') == 57"
+        );
+        py_run!(
+            py,
+            inst,
+            "assert type(inst).__getattribute__(inst, 'exists') == 42"
+        );
+
+        // Ensure that passing a wrong self type from Python does not cause UB
+        py_expect_exception!(
+            py,
+            inst,
+            "type(inst).__getattr__(object(), 'lucky')",
+            PyTypeError
+        );
     });
 }
 

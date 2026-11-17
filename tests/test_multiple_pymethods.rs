@@ -1,5 +1,6 @@
 #![cfg(feature = "multiple-pymethods")]
 
+use pyo3::exceptions::PyAttributeError;
 use pyo3::prelude::*;
 use pyo3::types::PyType;
 
@@ -49,6 +50,16 @@ impl PyClassWithMultiplePyMethods {
 
 #[pymethods]
 impl PyClassWithMultiplePyMethods {
+    fn __getattr__(&self, name: &str) -> PyResult<&'static str> {
+        match name {
+            "fallback" => Ok("fallback"),
+            _ => Err(PyAttributeError::new_err(name.to_string())),
+        }
+    }
+}
+
+#[pymethods]
+impl PyClassWithMultiplePyMethods {
     #[classattr]
     fn class_attribute() -> &'static str {
         "class_attribute"
@@ -71,5 +82,7 @@ fn test_class_with_multiple_pymethods() {
         py_assert!(py, cls, "cls.staticmethod() == 'staticmethod'");
         py_assert!(py, cls, "cls.class_attribute == 'class_attribute'");
         py_assert!(py, cls, "cls.CLASS_ATTRIBUTE == 'CLASS_ATTRIBUTE'");
+        py_assert!(py, cls, "cls().fallback == 'fallback'");
+        py_assert!(py, cls, "cls.__getattr__(cls(), 'fallback') == 'fallback'");
     })
 }
