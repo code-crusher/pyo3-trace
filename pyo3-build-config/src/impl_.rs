@@ -2643,14 +2643,41 @@ fn get_env_interpreter() -> Option<PathBuf> {
 ///   2. If in a virtualenv, that environment's interpreter is used.
 ///   3. `python`, if this is functional a Python 3.x interpreter
 ///   4. `python3`, as above
+///
+/// # Rebuild detection
+///
+/// By default, the build script is re-run when `PYO3_PYTHON` (or `PATH`, if used to find the
+/// interpreter) changes value. Build frontends such as `pip` or `maturin` may instead point
+/// `PYO3_PYTHON` at a temporary virtualenv that is recreated on every build, which makes the
+/// path change every time and needlessly invalidates the Cargo cache.
+///
+/// Setting `PYO3_BASE_PYTHON` to the path of the base interpreter that `PYO3_PYTHON` is based on
+/// (e.g. `sys._base_executable`) tracks the base interpreter's file (and the value of
+/// `PYO3_BASE_PYTHON` itself) instead of `PYO3_PYTHON`: the build script is re-run when the
+/// base interpreter is modified or replaced, but not when a new temporary virtualenv is
+/// created. If `PYO3_BASE_PYTHON` is set to a path that is not a file, it is ignored with a
+/// warning and the usual tracking applies. `PYO3_BASE_PYTHON` only affects rebuild detection,
+/// not which interpreter is used.
 pub fn find_interpreter() -> Result<PathBuf> {
     // Trigger rebuilds when `PYO3_ENVIRONMENT_SIGNATURE` env var value changes
     // See https://github.com/PyO3/pyo3/issues/2724
     println!("cargo:rerun-if-env-changed=PYO3_ENVIRONMENT_SIGNATURE");
 
-    if let Some(exe) = env_var("PYO3_PYTHON") {
+    if let Some(exe) = raw_env_var("PYO3_PYTHON") {
+        if let Some(base) = tracked_base_interpreter() {
+            // A stable base interpreter is provided, track that file instead of the
+            // (possibly temporary) path in `PYO3_PYTHON` so that builds remain cacheable
+            // when the virtualenv is recreated on each build (e.g. by `pip install .`).
+            track_base_interpreter(&base);
+        } else {
+            // Otherwise, track the value of `PYO3_PYTHON` as usual.
+            _ = env_var("PYO3_PYTHON");
+        }
         Ok(exe.into())
     } else if let Some(env_interpreter) = get_env_interpreter() {
+        if let Some(base) = tracked_base_interpreter() {
+            track_base_interpreter(&base);
+        }
         Ok(env_interpreter)
     } else {
         println!("cargo:rerun-if-env-changed=PATH");
@@ -2670,6 +2697,38 @@ pub fn find_interpreter() -> Result<PathBuf> {
             .map(PathBuf::from)
             .ok_or_else(|| "no Python 3.x interpreter found".into())
     }
+}
+
+/// Reads an environment variable without registering it for rebuild tracking.
+///
+/// Use this only when the value is not worth tracking, or when change detection is
+/// implemented by other means (e.g. `cargo:rerun-if-changed`).
+fn raw_env_var(var: &str) -> Option<OsString> {
+    env::var_os(var)
+}
+
+/// The stable base interpreter to track for rebuild detection, if one was provided.
+///
+/// Reads `PYO3_BASE_PYTHON` and returns the path it points at, provided that it is
+/// an existing file. If the variable is set to a non-existent path, a warning is
+/// emitted and `None` is returned so that the usual tracking behavior applies.
+fn tracked_base_interpreter() -> Option<PathBuf> {
+    let base = env_var("PYO3_BASE_PYTHON")?;
+    let base_path = PathBuf::from(&base);
+    if base_path.is_file() {
+        Some(base_path)
+    } else {
+        warn!(
+            "PYO3_BASE_PYTHON is set to `{}` which is not a file, ignoring it",
+            base_path.display()
+        );
+        None
+    }
+}
+
+/// Emit the directive that tracks the base interpreter for rebuild detection.
+fn track_base_interpreter(base: &Path) {
+    println!("cargo:rerun-if-changed={}", base.display());
 }
 
 /// Locates and extracts the build host Python interpreter configuration.
@@ -4635,6 +4694,125 @@ mod tests {
         let _ = InterpreterConfig::from_pyo3_config_file_env(&Triple::host());
         // it's possible that other env vars were also read, hence just checking for contains
         READ_ENV_VARS.with(|vars| assert!(vars.borrow().contains(&"PYO3_CONFIG_FILE".to_string())));
+    }
+
+    /// Serializes tests which mutate the process environment. Separate from the per-test guard
+    /// below, which only restores the environment. Rust runs tests on multiple threads, so the
+    /// env-mutating tests must hold this lock for the whole test body.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Clears the environment variables which `find_interpreter` reads, restoring them on drop.
+    struct InterpreterEnvGuard {
+        saved: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl InterpreterEnvGuard {
+        fn new() -> Self {
+            const VARS: [&str; 5] = [
+                "PYO3_PYTHON",
+                "PYO3_BASE_PYTHON",
+                "PYO3_ENVIRONMENT_SIGNATURE",
+                "VIRTUAL_ENV",
+                "CONDA_PREFIX",
+            ];
+            let saved = VARS
+                .iter()
+                .map(|var| (*var, std::env::var_os(var)))
+                .collect();
+            for var in VARS {
+                // SAFETY: tests run in a single thread per test binary; the caller must
+                // ensure no other thread is reading these variables concurrently.
+                unsafe { std::env::remove_var(var) };
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for InterpreterEnvGuard {
+        fn drop(&mut self) {
+            for (var, value) in &self.saved {
+                // SAFETY: tests run in a single thread per test binary; see above.
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(var, value),
+                        None => std::env::remove_var(var),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_tracked_base_interpreter() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = InterpreterEnvGuard::new();
+
+        // Not set at all: nothing to track.
+        assert_eq!(tracked_base_interpreter(), None);
+
+        // Set to a path that does not exist: ignored.
+        unsafe { std::env::set_var("PYO3_BASE_PYTHON", "/definitely/not/a/real/python") };
+        assert_eq!(tracked_base_interpreter(), None);
+
+        // Set to an existing file: returned for tracking.
+        let base =
+            std::env::temp_dir().join(format!("pyo3-base-interpreter-test-{}", std::process::id()));
+        std::fs::write(&base, b"fake base interpreter").unwrap();
+        unsafe { std::env::set_var("PYO3_BASE_PYTHON", &base) };
+        assert_eq!(tracked_base_interpreter(), Some(base.clone()));
+        std::fs::remove_file(&base).unwrap();
+    }
+
+    #[test]
+    fn test_find_interpreter_uses_pyo3_python() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = InterpreterEnvGuard::new();
+
+        // Point `PYO3_PYTHON` at a real, executable interpreter, as other tests
+        // running concurrently may invoke `find_interpreter` themselves.
+        let python = ["python3", "python"]
+            .iter()
+            .find(|bin| {
+                std::process::Command::new(bin)
+                    .arg("--version")
+                    .output()
+                    .is_ok()
+            })
+            .expect("tests require a Python interpreter to be installed");
+        let exe = PathBuf::from(python);
+        unsafe { std::env::set_var("PYO3_PYTHON", &exe) };
+
+        READ_ENV_VARS.with(|vars| vars.borrow_mut().clear());
+        let interpreter = find_interpreter().unwrap();
+        assert_eq!(interpreter, exe);
+        // Without a base interpreter, PYO3_PYTHON itself is tracked for rebuilds.
+        READ_ENV_VARS.with(|vars| assert!(vars.borrow().contains(&"PYO3_PYTHON".to_string())));
+
+        // With a base interpreter present, the volatile PYO3_PYTHON path is not tracked.
+        let base = std::env::temp_dir().join(format!(
+            "pyo3-find-interpreter-base-test-{}",
+            std::process::id()
+        ));
+        std::fs::write(&base, b"fake base interpreter").unwrap();
+        unsafe { std::env::set_var("PYO3_BASE_PYTHON", &base) };
+
+        READ_ENV_VARS.with(|vars| vars.borrow_mut().clear());
+        let interpreter = find_interpreter().unwrap();
+        assert_eq!(interpreter, exe);
+        READ_ENV_VARS.with(|vars| {
+            let vars = vars.borrow();
+            assert!(vars.contains(&"PYO3_BASE_PYTHON".to_string()));
+            assert!(!vars.contains(&"PYO3_PYTHON".to_string()));
+        });
+
+        // A base interpreter that does not exist falls back to tracking PYO3_PYTHON.
+        unsafe { std::env::set_var("PYO3_BASE_PYTHON", "/definitely/not/a/real/python") };
+        READ_ENV_VARS.with(|vars| vars.borrow_mut().clear());
+        let interpreter = find_interpreter().unwrap();
+        assert_eq!(interpreter, exe);
+        READ_ENV_VARS.with(|vars| assert!(vars.borrow().contains(&"PYO3_PYTHON".to_string())));
+
+        std::fs::remove_file(&base).unwrap();
     }
 
     #[test]

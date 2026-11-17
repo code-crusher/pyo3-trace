@@ -21,6 +21,8 @@ By default it will attempt to use the following in order:
 
 You can override the Python interpreter by setting the `PYO3_PYTHON` environment variable, e.g. `PYO3_PYTHON=python3.9`, `PYO3_PYTHON=/usr/bin/python3.10`, or even a PyPy interpreter `PYO3_PYTHON=pypy3`.
 
+The build script is re-run whenever the value of `PYO3_PYTHON` changes. Frontends such as `pip`, `uv` or `maturin` may point `PYO3_PYTHON` at a temporary virtualenv which is recreated with a new path on every build (e.g. when using [PEP 517](https://peps.python.org/pep-0517/) build isolation). In that situation, setting `PYO3_BASE_PYTHON` to the path of the underlying *base* interpreter (e.g. the value of `sys._base_executable`) tracks that stable path instead of `PYO3_PYTHON`, so that Cargo's cache is not invalidated when a new temporary virtualenv is created. `PYO3_BASE_PYTHON` only affects which file's modification time is tracked for rebuild purposes; the interpreter used is still the one resolved as described above. If `PYO3_BASE_PYTHON` is set to a path that is not a file, it is ignored with a warning.
+
 Once the Python interpreter is located, `pyo3-build-config` executes it to query the information in the `sysconfig` module which is needed to configure the rest of the compilation.
 
 To validate the configuration which PyO3 will use, you can run a compilation with the environment variable `PYO3_PRINT_CONFIG=1` set.
@@ -78,6 +80,8 @@ Caused by:
 ```
 
 The `PYO3_ENVIRONMENT_SIGNATURE` environment variable can be used to trigger rebuilds when its value changes, it has no other effect.
+
+When `PYO3_BASE_PYTHON` is used (see above), the build script additionally emits `cargo:rerun-if-changed=<path>` for the base interpreter, and does not emit `cargo:rerun-if-env-changed=PYO3_PYTHON`.
 
 ### Advanced: config files
 
