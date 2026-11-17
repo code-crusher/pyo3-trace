@@ -57,8 +57,10 @@ use crate::platform::prelude::*;
 #[cfg(Py_LIMITED_API)]
 use crate::types::{PyBytes, bytes::PyBytesMethods};
 use crate::{
-    Borrowed, Bound, FromPyObject, PyAny, PyErr, PyResult, Python, conversion::IntoPyObject,
-    conversions::std::num::nb_index, types::PyInt,
+    Borrowed, Bound, FromPyObject, PyAny, PyErr, PyResult, Python,
+    conversion::IntoPyObject,
+    conversions::std::num::{err_if_negative_int, nb_index},
+    types::PyInt,
 };
 
 use num_bigint::{BigInt, BigUint};
@@ -340,6 +342,9 @@ impl<'py> FromPyObject<'_, 'py> for BigUint {
         }
         #[cfg(not(Py_LIMITED_API))]
         {
+            // errors for negative values are remapped to `ValueError` inside
+            // `int_to_u32_vec`, matching newer CPython APIs such as
+            // `PyLong_AsUInt64` (3.14+)
             let buffer = int_to_u32_vec::<false>(&num)?;
             Ok(BigUint::new(buffer))
         }
@@ -349,7 +354,11 @@ impl<'py> FromPyObject<'_, 'py> for BigUint {
             if n_bits == 0 {
                 return Ok(BigUint::from(0usize));
             }
-            let bytes = int_to_py_bytes(&num, n_bits.div_ceil(8), false)?;
+            // `int.to_bytes` raises `OverflowError` for negative values when
+            // not using `signed=True`; remap to `ValueError` to match newer
+            // CPython APIs such as `PyLong_AsUInt64` (3.14+)
+            let bytes = int_to_py_bytes(&num, n_bits.div_ceil(8), false)
+                .map_err(|e| err_if_negative_int(num.as_any().as_borrowed(), e))?;
             Ok(BigUint::from_bytes_le(bytes.as_bytes()))
         }
     }
@@ -435,6 +444,9 @@ fn int_to_u32_vec<const SIGNED: bool>(long: &Bound<'_, PyInt>) -> PyResult<Vec<u
     // SAFETY: `buffer` has capacity for `n_digits` u32s, which `_PyLong_AsByteArray`
     // fully initializes on success; `set_len` is only reached on success
     unsafe {
+        // negative values rejected here by CPython raise `OverflowError`;
+        // remap to `ValueError` to match newer APIs such as `PyLong_AsUInt64`
+        // (3.14+)
         crate::err::error_on_negative(
             long.py(),
             ffi::_PyLong_AsByteArray(
@@ -444,7 +456,14 @@ fn int_to_u32_vec<const SIGNED: bool>(long: &Bound<'_, PyInt>) -> PyResult<Vec<u
                 1,
                 SIGNED.into(),
             ),
-        )?;
+        )
+        .map_err(|e| {
+            if SIGNED {
+                e
+            } else {
+                err_if_negative_int(long.as_any().as_borrowed(), e)
+            }
+        })?;
         buffer.set_len(n_digits)
     };
     buffer
@@ -695,7 +714,6 @@ class C:
         });
     }
 
-    #[cfg(any(all(Py_3_14, not(Py_LIMITED_API)), Py_3_15))]
     #[test]
     fn biguint_negative() {
         Python::attach(|py| {

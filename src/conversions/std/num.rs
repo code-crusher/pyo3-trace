@@ -26,7 +26,7 @@ use super::array::invalid_sequence_length;
 pub(crate) const INT_INPUT_TYPE: PyStaticExpr = type_hint_identifier!("typing", "SupportsIndex");
 
 macro_rules! int_fits_larger_int {
-    ($rust_type:ty, $larger_type:ty) => {
+    ($rust_type:ty, $larger_type:ty, $is_signed:literal) => {
         impl<'py> IntoPyObject<'py> for $rust_type {
             type Target = PyInt;
             type Output = Bound<'py, Self::Target>;
@@ -60,7 +60,14 @@ macro_rules! int_fits_larger_int {
             const INPUT_TYPE: PyStaticExpr = <$larger_type>::INPUT_TYPE;
 
             fn extract(obj: Borrowed<'_, '_, PyAny>) -> Result<Self, Self::Error> {
-                let val: $larger_type = obj.extract()?;
+                let val: $larger_type = if $is_signed {
+                    obj.extract()?
+                } else {
+                    // older CPython APIs raise `OverflowError` for negative
+                    // values converted to unsigned; remap to `ValueError` to
+                    // match newer APIs such as `PyLong_AsUInt64` (3.14+)
+                    obj.extract().map_err(|e| err_if_negative_int(obj, e))?
+                };
                 <$rust_type>::try_from(val)
                     .map_err(|e| exceptions::PyOverflowError::new_err(e.to_string()))
             }
@@ -94,7 +101,7 @@ macro_rules! extract_int {
 }
 
 macro_rules! int_convert_u64_or_i64 {
-    ($rust_type:ty, $pylong_from_ll_or_ull:expr, $pylong_as_ll_or_ull:expr, $force_index_call:literal) => {
+    ($rust_type:ty, $pylong_from_ll_or_ull:expr, $pylong_as_ll_or_ull:expr, $force_index_call:literal, $is_signed:literal) => {
         impl<'py> IntoPyObject<'py> for $rust_type {
             type Target = PyInt;
             type Output = Bound<'py, Self::Target>;
@@ -131,14 +138,22 @@ macro_rules! int_convert_u64_or_i64 {
             const INPUT_TYPE: PyStaticExpr = INT_INPUT_TYPE;
 
             fn extract(obj: Borrowed<'_, '_, PyAny>) -> Result<$rust_type, Self::Error> {
-                extract_int!(obj, !0, $pylong_as_ll_or_ull, $force_index_call)
+                let val = extract_int!(obj, !0, $pylong_as_ll_or_ull, $force_index_call);
+                if $is_signed {
+                    val
+                } else {
+                    // older CPython APIs raise `OverflowError` for negative
+                    // values converted to unsigned; remap to `ValueError` to
+                    // match newer APIs such as `PyLong_AsUInt64` (3.14+)
+                    val.map_err(|e| err_if_negative_int(obj, e))
+                }
             }
         }
     };
 }
 
 macro_rules! int_fits_c_long {
-    ($rust_type:ty) => {
+    ($rust_type:ty, $is_signed:literal) => {
         impl<'py> IntoPyObject<'py> for $rust_type {
             type Target = PyInt;
             type Output = Bound<'py, Self::Target>;
@@ -179,8 +194,16 @@ macro_rules! int_fits_c_long {
             fn extract(obj: Borrowed<'_, 'py, PyAny>) -> Result<Self, Self::Error> {
                 let val: c_long = extract_int!(obj, -1, ffi::PyLong_AsLong)?;
                 #[allow(unreachable_code, reason = "error type might be !")]
-                <$rust_type>::try_from(val)
-                    .map_err(|e| exceptions::PyOverflowError::new_err(e.to_string()))
+                <$rust_type>::try_from(val).map_err(|e| {
+                    if !$is_signed && val < 0 {
+                        // negative values never fit unsigned types; newer CPython
+                        // APIs such as `PyLong_AsUInt64` (3.14+) raise `ValueError`
+                        // for this case, so match that convention
+                        exceptions::PyValueError::new_err("can't convert negative int to unsigned")
+                    } else {
+                        exceptions::PyOverflowError::new_err(e.to_string())
+                    }
+                })
             }
         }
     };
@@ -255,7 +278,16 @@ impl<'py> FromPyObject<'_, 'py> for u8 {
 
     fn extract(obj: Borrowed<'_, 'py, PyAny>) -> Result<Self, Self::Error> {
         let val: c_long = extract_int!(obj, -1, ffi::PyLong_AsLong)?;
-        u8::try_from(val).map_err(|e| exceptions::PyOverflowError::new_err(e.to_string()))
+        u8::try_from(val).map_err(|e| {
+            if val < 0 {
+                // negative values never fit unsigned types; newer CPython APIs
+                // such as `PyLong_AsUInt64` (3.14+) raise `ValueError` for this
+                // case, so match that convention
+                exceptions::PyValueError::new_err("can't convert negative int to unsigned")
+            } else {
+                exceptions::PyOverflowError::new_err(e.to_string())
+            }
+        })
     }
 
     #[inline]
@@ -328,37 +360,44 @@ impl FromPyObjectSequence for BytesSequenceExtractor<'_, '_> {
     }
 }
 
-int_fits_c_long!(i8);
-int_fits_c_long!(i16);
-int_fits_c_long!(u16);
-int_fits_c_long!(i32);
+int_fits_c_long!(i8, true);
+int_fits_c_long!(i16, true);
+int_fits_c_long!(u16, false);
+int_fits_c_long!(i32, true);
 
 // If c_long is 64-bits, we can use more types with int_fits_c_long!:
 #[cfg(all(target_pointer_width = "64", not(target_os = "windows")))]
-int_fits_c_long!(u32);
+int_fits_c_long!(u32, false);
 #[cfg(any(target_pointer_width = "32", target_os = "windows"))]
-int_fits_larger_int!(u32, u64);
+int_fits_larger_int!(u32, u64, false);
 
 #[cfg(all(target_pointer_width = "64", not(target_os = "windows")))]
-int_fits_c_long!(i64);
+int_fits_c_long!(i64, true);
 
 // manual implementation for i64 on systems with 32-bit long
 #[cfg(any(target_pointer_width = "32", target_os = "windows"))]
-int_convert_u64_or_i64!(i64, ffi::PyLong_FromLongLong, ffi::PyLong_AsLongLong, false);
+int_convert_u64_or_i64!(
+    i64,
+    ffi::PyLong_FromLongLong,
+    ffi::PyLong_AsLongLong,
+    false,
+    true
+);
 
 #[cfg(all(target_pointer_width = "64", not(target_os = "windows")))]
-int_fits_c_long!(isize);
+int_fits_c_long!(isize, true);
 #[cfg(any(target_pointer_width = "32", target_os = "windows"))]
-int_fits_larger_int!(isize, i64);
+int_fits_larger_int!(isize, i64, true);
 
-int_fits_larger_int!(usize, u64);
+int_fits_larger_int!(usize, u64, false);
 
 // u64 has a manual implementation as it never fits into signed long
 int_convert_u64_or_i64!(
     u64,
     ffi::PyLong_FromUnsignedLongLong,
     ffi::PyLong_AsUnsignedLongLong,
-    true
+    true,
+    false
 );
 
 #[cfg(any(all(Py_3_14, not(Py_LIMITED_API)), Py_3_15))]
@@ -643,6 +682,9 @@ mod fast_128bit_int_conversion {
                     let mut buffer = [0u8; core::mem::size_of::<$rust_type>()];
                     #[cfg(not(Py_3_13))]
                     {
+                        // negative values rejected here by CPython raise
+                        // `OverflowError`; remap to `ValueError` to match newer
+                        // APIs such as `PyLong_AsUInt64` (3.14+)
                         crate::err::error_on_negative(ob.py(), unsafe {
                             ffi::_PyLong_AsByteArray(
                                 num.as_ptr() as *mut ffi::PyLongObject,
@@ -651,6 +693,13 @@ mod fast_128bit_int_conversion {
                                 1,
                                 $is_signed.into(),
                             )
+                        })
+                        .map_err(|e| {
+                            if $is_signed {
+                                e
+                            } else {
+                                err_if_negative_int(num.as_any().as_borrowed(), e)
+                            }
                         })?;
                         Ok(<$rust_type>::from_le_bytes(buffer))
                     }
@@ -673,7 +722,17 @@ mod fast_128bit_int_conversion {
                             )
                         }
                         .try_into()
-                        .map_err(|_| PyErr::fetch(ob.py()))?;
+                        .map_err(|_| {
+                            let err = PyErr::fetch(ob.py());
+                            if $is_signed {
+                                err
+                            } else {
+                                // for negative values CPython raises
+                                // `ValueError` here; normalize the message to
+                                // match the other conversion paths
+                                err_if_negative_int(num.as_any().as_borrowed(), err)
+                            }
+                        })?;
                         if actual_size as usize > buffer.len() {
                             return Err(crate::exceptions::PyOverflowError::new_err(
                                 "Python int larger than 128 bits",
@@ -733,7 +792,7 @@ mod slow_128bit_int_conversion {
 
     // for 128bit Integers
     macro_rules! int_convert_128 {
-        ($rust_type: ty, $half_type: ty) => {
+        ($rust_type: ty, $half_type: ty, $is_signed: literal) => {
             impl<'py> IntoPyObject<'py> for $rust_type {
                 type Target = PyInt;
                 type Output = Bound<'py, Self::Target>;
@@ -779,10 +838,25 @@ mod slow_128bit_int_conversion {
 
                 fn extract(ob: Borrowed<'_, '_, PyAny>) -> Result<$rust_type, Self::Error> {
                     let py = ob.py();
+                    if !$is_signed {
+                        // `PyLong_AsUnsignedLongLongMask` silently wraps negative
+                        // values, so reject them up-front; newer CPython APIs such
+                        // as `PyLong_AsUInt64` (3.14+) raise `ValueError` for this
+                        let is_negative = if let Ok(long) = ob.cast::<PyInt>() {
+                            long.lt(0)?
+                        } else {
+                            nb_index(&ob)?.lt(0)?
+                        };
+                        if is_negative {
+                            return Err(exceptions::PyValueError::new_err(
+                                "can't convert negative int to unsigned",
+                            ));
+                        }
+                    }
                     unsafe {
                         let lower = err_if_invalid_value(
                             py,
-                            -1 as _,
+                            -1i64 as _,
                             ffi::PyLong_AsUnsignedLongLongMask(ob.as_ptr()),
                         )? as $rust_type;
                         let shift = SHIFT.into_pyobject(py)?;
@@ -798,10 +872,9 @@ mod slow_128bit_int_conversion {
         };
     }
 
-    int_convert_128!(i128, i64);
-    int_convert_128!(u128, u64);
+    int_convert_128!(i128, i64, true);
+    int_convert_128!(u128, u64, false);
 }
-
 fn err_if_invalid_value<T: PartialEq>(
     py: Python<'_>,
     invalid_value: T,
@@ -814,6 +887,32 @@ fn err_if_invalid_value<T: PartialEq>(
     }
 
     Ok(actual_value)
+}
+
+// CPython's conversion functions raise inconsistent errors for negative values
+// being converted to unsigned types: older APIs such as `PyLong_AsUnsignedLongLong`
+// raise `OverflowError` with the message "can't convert negative int to unsigned",
+// while newer APIs such as `PyLong_AsUInt64` (Python 3.14+) and
+// `PyLong_AsNativeBytes` with `Py_ASNATIVEBYTES_REJECT_NEGATIVE` raise `ValueError`
+// with a different message. For a negative input any conversion failure is due to
+// the negativity, so consistently raise `ValueError`.
+pub(crate) fn err_if_negative_int(obj: Borrowed<'_, '_, PyAny>, err: PyErr) -> PyErr {
+    use crate::types::any::PyAnyMethods as _;
+
+    // determine whether the object is a negative int, possibly via `__index__`
+    let is_negative = match obj.cast::<PyInt>() {
+        Ok(long) => long.lt(0).unwrap_or(false),
+        Err(_) => match nb_index(&obj) {
+            Ok(long) => long.lt(0).unwrap_or(false),
+            Err(_) => false,
+        },
+    };
+
+    if is_negative {
+        exceptions::PyValueError::new_err("can't convert negative int to unsigned")
+    } else {
+        err
+    }
 }
 
 macro_rules! nonzero_int_impl {
@@ -1147,6 +1246,27 @@ mod tests {
         });
     }
 
+    #[test]
+    fn test_u64_negative() {
+        use crate::alloc::string::ToString;
+        use crate::exceptions;
+
+        Python::attach(|py| {
+            let obj = py.eval(c"-1", None, None).unwrap();
+            let err = obj.extract::<u64>().unwrap_err();
+            assert!(err.is_instance_of::<exceptions::PyValueError>(py));
+            assert_eq!(
+                err.value(py).to_string(),
+                "can't convert negative int to unsigned"
+            );
+
+            // positive out-of-range values still raise `OverflowError`
+            let obj = py.eval(c"1 << 130", None, None).unwrap();
+            let err = obj.extract::<u64>().unwrap_err();
+            assert!(err.is_instance_of::<exceptions::PyOverflowError>(py));
+        });
+    }
+
     macro_rules! test_common (
         ($test_mod_name:ident, $t:ty) => (
             mod $test_mod_name {
@@ -1178,6 +1298,19 @@ mod tests {
                     let val = 123 as $t;
                     let obj = val.into_pyobject(py).unwrap();
                     assert_eq!(obj.extract::<$t>().unwrap(), val as $t);});
+                }
+
+                #[test]
+                fn negative_to_unsigned_is_value_error() {
+                    Python::attach(|py| {
+                    let obj = py.eval(c"-1", None, None).unwrap();
+                    match obj.extract::<$t>() {
+                        // signed types can represent -1
+                        Ok(val) => assert_eq!(Ok(val), <$t>::try_from(-1i8)),
+                        // negative-to-unsigned conversions raise `ValueError`,
+                        // matching newer CPython APIs such as `PyLong_AsUInt64`
+                        Err(err) => assert!(err.is_instance_of::<exceptions::PyValueError>(py)),
+                    };});
                 }
             }
         )
@@ -1274,6 +1407,19 @@ mod tests {
                     let val = <$t>::new(123).unwrap();
                     let obj = val.into_pyobject(py).unwrap();
                     assert_eq!(obj.extract::<$t>().unwrap(), val);});
+                }
+
+                #[test]
+                fn negative_to_unsigned_is_value_error() {
+                    Python::attach(|py| {
+                    let obj = py.eval(c"-1", None, None).unwrap();
+                    match obj.extract::<$t>() {
+                        // signed types can represent -1
+                        Ok(val) => assert_eq!(val.get() as i128, -1),
+                        // negative-to-unsigned conversions raise `ValueError`,
+                        // matching newer CPython APIs such as `PyLong_AsUInt64`
+                        Err(err) => assert!(err.is_instance_of::<exceptions::PyValueError>(py)),
+                    };});
                 }
             }
         )
