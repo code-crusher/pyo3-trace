@@ -173,7 +173,7 @@ pub mod iter {
     #[cfg(Py_3_15)]
     pub use super::frozendict::BoundFrozenDictIterator;
     pub use super::frozenset::BoundFrozenSetIterator;
-    pub use super::list::BoundListIterator;
+    pub use super::list::{BoundListIterator, BoundListReverseIterator};
     pub use super::set::BoundSetIterator;
     pub use super::tuple::{BorrowedTupleIterator, BoundTupleIterator};
 }

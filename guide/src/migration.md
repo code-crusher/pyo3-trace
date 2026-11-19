@@ -5,6 +5,52 @@ For a detailed list of all changes, see the [CHANGELOG](changelog.md).
 
 ## from 0.30.* to 0.31
 
+### `PyList` iterators now match Python semantics
+
+<details open>
+<summary><small>Click to expand</small></summary>
+
+`BoundListIterator` (returned by `PyListMethods::iter`) used to implement `DoubleEndedIterator`,
+`ExactSizeIterator` and `FusedIterator`. These implementations did not match the behaviour of
+Python's `list_iterator`, because a Python `list` may be resized while it is being iterated.
+They have been removed:
+
+- `ExactSizeIterator` and `FusedIterator` were incorrect, as the list may grow or shrink during
+  iteration. In particular, an iterator could yield fewer items than `len()` promised, and could
+  yield more items after having returned `None`.
+- `DoubleEndedIterator` forced the iterator to remember the list's length at creation, so that
+  `nth_back` could produce values. This meant that items appended during iteration were never
+  yielded, unlike Python's `list_iterator`.
+
+`BoundListIterator` now tracks the list's live length: items appended during iteration are
+yielded, and once it returns `None` it stays exhausted. Its `size_hint` is `(0, None)`.
+
+Reverse iteration is provided by the new `PyListMethods::iter_rev`, which returns a
+`BoundListReverseIterator`. This is equivalent to Python's `reversed(list)`.
+
+```rust
+# use pyo3::prelude::*;
+# use pyo3::types::PyList;
+# fn main() -> PyResult<()> {
+Python::attach(|py| {
+    let list = PyList::new(py, [1, 2, 3])?;
+
+    // before: `list.iter().rev()`
+    let mut items = Vec::new();
+    for item in list.iter_rev() {
+        items.push(item.extract::<i32>()?);
+    }
+    assert_eq!(items, [3, 2, 1]);
+    # Ok::<_, PyErr>(())
+})
+# }
+```
+
+`BoundListReverseIterator` also implements `Iterator` only, and its `size_hint` is
+`(0, Some(remaining))`, because the list may shrink during iteration.
+
+</details>
+
 ### Removed methods from `PyBuffer<T>`: `as_slice`, `as_mut_slice`, `as_fortran_slice`, and `as_fortran_mut_slice`
 
 <details open>

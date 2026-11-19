@@ -15,7 +15,6 @@ use crate::{
     sync::PyOnceLock,
     types::{PyType, PyTypeMethods},
 };
-use core::iter::FusedIterator;
 #[cfg(feature = "nightly")]
 use core::num::NonZero;
 
@@ -223,7 +222,22 @@ pub trait PyListMethods<'py>: crate::sealed::Sealed {
         V: IntoPyObject<'py>;
 
     /// Returns an iterator over this list's items.
+    ///
+    /// This is equivalent to the Python expression `iter(self)`.
+    ///
+    /// As with Python's `list_iterator`, the iterator tracks the list's current length: if items
+    /// are appended while iterating, they will be yielded; if items are removed such that the
+    /// iteration position is no longer in the list, iteration stops. Once the iterator has
+    /// returned `None` it stays exhausted, even if the list subsequently grows.
     fn iter(&self) -> BoundListIterator<'py>;
+
+    /// Returns an iterator over this list's items in reverse order.
+    ///
+    /// This is equivalent to the Python expression `reversed(self)`.
+    ///
+    /// As with Python's `list_reverseiterator`, the iteration position is captured when the
+    /// iterator is created, so items appended to the list afterwards are not yielded.
+    fn iter_rev(&self) -> BoundListReverseIterator<'py>;
 
     /// Iterates over the contents of this list while holding a critical section on the list.
     /// This is useful when the GIL is disabled and the list is shared between threads.
@@ -427,6 +441,11 @@ impl<'py> PyListMethods<'py> for Bound<'py, PyList> {
         BoundListIterator::new(self.clone())
     }
 
+    /// Returns an iterator over this list's items in reverse order.
+    fn iter_rev(&self) -> BoundListReverseIterator<'py> {
+        BoundListReverseIterator::new(self.clone())
+    }
+
     /// Iterates over a list while holding a critical section, calling a closure on each item
     fn locked_for_each<F>(&self, closure: F) -> PyResult<()>
     where
@@ -459,24 +478,27 @@ impl<'py> PyListMethods<'py> for Bound<'py, PyList> {
     }
 }
 
-// New types for type checking when using BoundListIterator associated methods, like
-// BoundListIterator::next_unsynchronized.
-struct Index(usize);
-struct Length(usize);
-
 /// Used by `PyList::iter()`.
+///
+/// As with Python's `list_iterator`, this tracks the list's current length, so items appended
+/// during iteration are yielded. Once the iterator has returned `None` it stays exhausted.
 pub struct BoundListIterator<'py> {
     list: Bound<'py, PyList>,
-    index: Index,
-    length: Length,
+    /// The index of the next item to yield.
+    index: usize,
+    /// Whether this iterator has returned `None`.
+    ///
+    /// Like Python's `list_iterator`, exhaustion is permanent: an iterator which has run off the
+    /// end of the list will not resume even if the list grows again afterwards.
+    exhausted: bool,
 }
 
 impl<'py> BoundListIterator<'py> {
     fn new(list: Bound<'py, PyList>) -> Self {
         Self {
-            index: Index(0),
-            length: Length(list.len()),
             list,
+            index: 0,
+            exhausted: false,
         }
     }
 
@@ -485,19 +507,23 @@ impl<'py> BoundListIterator<'py> {
     /// The caller must hold an active critical section on this list.
     #[inline]
     unsafe fn next_unsynchronized(
-        index: &mut Index,
-        length: &mut Length,
+        index: &mut usize,
+        exhausted: &mut bool,
         list: &Bound<'py, PyList>,
     ) -> Option<Bound<'py, PyAny>> {
-        let length = length.0.min(list.len());
-        let my_index = index.0;
+        if *exhausted {
+            return None;
+        }
 
-        if index.0 < length {
-            // SAFETY: index.0 < list.len() guarantees in bounds
-            let item = unsafe { list.get_item_unchecked(my_index) };
-            index.0 += 1;
+        if *index < list.len() {
+            // SAFETY: index < list.len() guarantees in bounds
+            let item = unsafe { list.get_item_unchecked(*index) };
+            // cannot overflow as index < list.len()
+            *index += 1;
             Some(item)
         } else {
+            // out of bounds; like Python's `list_iterator`, stay exhausted from now on
+            *exhausted = true;
             None
         }
     }
@@ -508,88 +534,42 @@ impl<'py> BoundListIterator<'py> {
     #[inline]
     #[cfg(not(feature = "nightly"))]
     unsafe fn nth_unsynchronized(
-        index: &mut Index,
-        length: &mut Length,
+        index: &mut usize,
+        exhausted: &mut bool,
         list: &Bound<'py, PyList>,
         n: usize,
     ) -> Option<Bound<'py, PyAny>> {
-        let current_length = length.0.min(list.len());
-        if let Some(target_index) = index.0.checked_add(n) {
-            if target_index < current_length {
-                // SAFETY: target_index < current_length guarantees in bounds
+        if *exhausted {
+            return None;
+        }
+
+        let length = list.len();
+        if let Some(target_index) = (*index).checked_add(n) {
+            if target_index < length {
+                // SAFETY: target_index < list.len() guarantees in bounds
                 let item = unsafe { list.get_item_unchecked(target_index) };
-                // +1 cannot overflow as target_index < current_length
-                index.0 = target_index + 1;
+                // +1 cannot overflow as target_index < length
+                *index = target_index + 1;
                 return Some(item);
             }
         }
 
         // n overflows the remaining length of the list;
         // nth must exhaust all remaining items
-        index.0 = current_length;
-        None
-    }
-
-    /// # Safety
-    ///
-    /// The caller must hold an active critical section on this list.
-    #[inline]
-    unsafe fn next_back_unsynchronized(
-        index: &mut Index,
-        length: &mut Length,
-        list: &Bound<'py, PyList>,
-    ) -> Option<Bound<'py, PyAny>> {
-        let current_length = length.0.min(list.len());
-
-        if index.0 < current_length {
-            // SAFETY: index.0 < list.len() guarantees in bounds
-            let item = unsafe { list.get_item_unchecked(current_length - 1) };
-            length.0 = current_length - 1;
-            Some(item)
-        } else {
-            None
-        }
-    }
-
-    /// # Safety
-    ///
-    /// The caller must hold an active critical section on this list.
-    #[inline]
-    #[cfg(not(feature = "nightly"))]
-    unsafe fn nth_back_unsynchronized(
-        index: &mut Index,
-        length: &mut Length,
-        list: &Bound<'py, PyList>,
-        n: usize,
-    ) -> Option<Bound<'py, PyAny>> {
-        let current_length = length.0.min(list.len());
-        if let Some(index_after_item) = current_length.checked_sub(n) {
-            if index.0 < index_after_item {
-                // -1 cannot underflow as index_after_item > index
-                let target_index = index_after_item - 1;
-                // SAFETY: target_index is < current_length
-                let item = unsafe { list.get_item_unchecked(target_index) };
-                length.0 = target_index;
-                return Some(item);
-            }
-        }
-
-        // n overflows the remaining length of the tuple;
-        // nth must exhaust all remaining items
-        length.0 = index.0;
+        *exhausted = true;
         None
     }
 
     fn with_critical_section<R>(
         &mut self,
-        f: impl FnOnce(&mut Index, &mut Length, &Bound<'py, PyList>) -> R,
+        f: impl FnOnce(&mut usize, &mut bool, &Bound<'py, PyList>) -> R,
     ) -> R {
         let Self {
             index,
-            length,
+            exhausted,
             list,
         } = self;
-        crate::sync::critical_section::with_critical_section(list, || f(index, length, list))
+        crate::sync::critical_section::with_critical_section(list, || f(index, exhausted, list))
     }
 }
 
@@ -599,8 +579,8 @@ impl<'py> Iterator for BoundListIterator<'py> {
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         // SAFETY: with_critical_section locks the list
-        self.with_critical_section(|index, length, list| unsafe {
-            Self::next_unsynchronized(index, length, list)
+        self.with_critical_section(|index, exhausted, list| unsafe {
+            Self::next_unsynchronized(index, exhausted, list)
         })
     }
 
@@ -608,31 +588,16 @@ impl<'py> Iterator for BoundListIterator<'py> {
     #[cfg(not(feature = "nightly"))]
     fn nth(&mut self, n: usize) -> Option<Self::Item> {
         // SAFETY: with_critical_section locks the list
-        self.with_critical_section(|index, length, list| unsafe {
-            Self::nth_unsynchronized(index, length, list, n)
+        self.with_critical_section(|index, exhausted, list| unsafe {
+            Self::nth_unsynchronized(index, exhausted, list, n)
         })
     }
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = self.len();
-        (len, Some(len))
-    }
-
-    #[inline]
-    fn count(self) -> usize
-    where
-        Self: Sized,
-    {
-        self.len()
-    }
-
-    #[inline]
-    fn last(mut self) -> Option<Self::Item>
-    where
-        Self: Sized,
-    {
-        self.next_back()
+        // The list may be resized by other Python code while this iterator is alive, so the
+        // number of remaining items is unbounded (and may be zero).
+        (0, None)
     }
 
     #[inline]
@@ -642,10 +607,10 @@ impl<'py> Iterator for BoundListIterator<'py> {
         Self: Sized,
         F: FnMut(B, Self::Item) -> B,
     {
-        self.with_critical_section(|index, length, list| {
+        self.with_critical_section(|index, exhausted, list| {
             let mut accum = init;
             // SAFETY: with_critical_section locks the list
-            while let Some(x) = unsafe { Self::next_unsynchronized(index, length, list) } {
+            while let Some(x) = unsafe { Self::next_unsynchronized(index, exhausted, list) } {
                 accum = f(accum, x);
             }
             accum
@@ -660,10 +625,10 @@ impl<'py> Iterator for BoundListIterator<'py> {
         F: FnMut(B, Self::Item) -> R,
         R: core::ops::Try<Output = B>,
     {
-        self.with_critical_section(|index, length, list| {
+        self.with_critical_section(|index, exhausted, list| {
             let mut accum = init;
             // SAFETY: with_critical_section locks the list
-            while let Some(x) = unsafe { Self::next_unsynchronized(index, length, list) } {
+            while let Some(x) = unsafe { Self::next_unsynchronized(index, exhausted, list) } {
                 accum = f(accum, x)?
             }
             R::from_output(accum)
@@ -677,9 +642,9 @@ impl<'py> Iterator for BoundListIterator<'py> {
         Self: Sized,
         F: FnMut(Self::Item) -> bool,
     {
-        self.with_critical_section(|index, length, list| {
+        self.with_critical_section(|index, exhausted, list| {
             // SAFETY: with_critical_section locks the list
-            while let Some(x) = unsafe { Self::next_unsynchronized(index, length, list) } {
+            while let Some(x) = unsafe { Self::next_unsynchronized(index, exhausted, list) } {
                 if !f(x) {
                     return false;
                 }
@@ -695,9 +660,9 @@ impl<'py> Iterator for BoundListIterator<'py> {
         Self: Sized,
         F: FnMut(Self::Item) -> bool,
     {
-        self.with_critical_section(|index, length, list| {
+        self.with_critical_section(|index, exhausted, list| {
             // SAFETY: with_critical_section locks the list
-            while let Some(x) = unsafe { Self::next_unsynchronized(index, length, list) } {
+            while let Some(x) = unsafe { Self::next_unsynchronized(index, exhausted, list) } {
                 if f(x) {
                     return true;
                 }
@@ -713,9 +678,9 @@ impl<'py> Iterator for BoundListIterator<'py> {
         Self: Sized,
         P: FnMut(&Self::Item) -> bool,
     {
-        self.with_critical_section(|index, length, list| {
+        self.with_critical_section(|index, exhausted, list| {
             // SAFETY: with_critical_section locks the list
-            while let Some(x) = unsafe { Self::next_unsynchronized(index, length, list) } {
+            while let Some(x) = unsafe { Self::next_unsynchronized(index, exhausted, list) } {
                 if predicate(&x) {
                     return Some(x);
                 }
@@ -731,9 +696,9 @@ impl<'py> Iterator for BoundListIterator<'py> {
         Self: Sized,
         F: FnMut(Self::Item) -> Option<B>,
     {
-        self.with_critical_section(|index, length, list| {
+        self.with_critical_section(|index, exhausted, list| {
             // SAFETY: with_critical_section locks the list
-            while let Some(x) = unsafe { Self::next_unsynchronized(index, length, list) } {
+            while let Some(x) = unsafe { Self::next_unsynchronized(index, exhausted, list) } {
                 if let found @ Some(_) = f(x) {
                     return found;
                 }
@@ -749,10 +714,10 @@ impl<'py> Iterator for BoundListIterator<'py> {
         Self: Sized,
         P: FnMut(Self::Item) -> bool,
     {
-        self.with_critical_section(|index, length, list| {
+        self.with_critical_section(|index, exhausted, list| {
             let mut acc = 0;
             // SAFETY: with_critical_section locks the list
-            while let Some(x) = unsafe { Self::next_unsynchronized(index, length, list) } {
+            while let Some(x) = unsafe { Self::next_unsynchronized(index, exhausted, list) } {
                 if predicate(x) {
                     return Some(acc);
                 }
@@ -765,50 +730,175 @@ impl<'py> Iterator for BoundListIterator<'py> {
     #[inline]
     #[cfg(feature = "nightly")]
     fn advance_by(&mut self, n: usize) -> Result<(), NonZero<usize>> {
-        self.with_critical_section(|index, length, list| {
-            let current_length = length.0.min(list.len());
-            let items_left = current_length.saturating_sub(index.0);
+        self.with_critical_section(|index, exhausted, list| {
+            let items_left = if *exhausted {
+                0
+            } else {
+                list.len().saturating_sub(*index)
+            };
             if let Some(overflow) = NonZero::new(n.saturating_sub(items_left)) {
                 // n overflows the remaining length of the list; advance_by must exhaust all remaining items
-                index.0 = current_length;
+                *exhausted = true;
                 return Err(overflow);
             }
 
             // cannot overflow as length - index >= n
-            index.0 += n;
+            *index += n;
             Ok(())
         })
     }
 }
 
-impl DoubleEndedIterator for BoundListIterator<'_> {
+/// Used by `PyList::iter_rev()`.
+///
+/// This is equivalent to Python's `list_reverseiterator`. The iteration position is captured when
+/// the iterator is created, so items appended to the list afterwards are not yielded.
+pub struct BoundListReverseIterator<'py> {
+    list: Bound<'py, PyList>,
+    /// The index of the next item to yield.
+    index: usize,
+    /// Whether this iterator has returned `None`.
+    ///
+    /// Like Python's `list_reverseiterator`, exhaustion is permanent: an iterator which has run off
+    /// the front of the list will not resume even if the list grows again afterwards.
+    exhausted: bool,
+}
+
+impl<'py> BoundListReverseIterator<'py> {
+    fn new(list: Bound<'py, PyList>) -> Self {
+        let length = list.len();
+        Self {
+            list,
+            // `index` is only meaningful while not exhausted
+            index: length.saturating_sub(1),
+            exhausted: length == 0,
+        }
+    }
+
+    /// # Safety
+    ///
+    /// The caller must hold an active critical section on this list.
     #[inline]
-    fn next_back(&mut self) -> Option<Self::Item> {
-        self.with_critical_section(|index, length, list| unsafe {
-            Self::next_back_unsynchronized(index, length, list)
+    unsafe fn next_unsynchronized(
+        index: &mut usize,
+        exhausted: &mut bool,
+        list: &Bound<'py, PyList>,
+    ) -> Option<Bound<'py, PyAny>> {
+        if *exhausted {
+            return None;
+        }
+
+        if *index < list.len() {
+            // SAFETY: index < list.len() guarantees in bounds
+            let item = unsafe { list.get_item_unchecked(*index) };
+            if *index == 0 {
+                *exhausted = true;
+            } else {
+                // cannot underflow as index > 0
+                *index -= 1;
+            }
+            Some(item)
+        } else {
+            // the list has shrunk below the iteration position; like Python's
+            // `list_reverseiterator`, stay exhausted from now on
+            *exhausted = true;
+            None
+        }
+    }
+
+    /// # Safety
+    ///
+    /// The caller must hold an active critical section on this list.
+    #[inline]
+    #[cfg(not(feature = "nightly"))]
+    unsafe fn nth_unsynchronized(
+        index: &mut usize,
+        exhausted: &mut bool,
+        list: &Bound<'py, PyList>,
+        n: usize,
+    ) -> Option<Bound<'py, PyAny>> {
+        if *exhausted {
+            return None;
+        }
+
+        if *index < list.len() {
+            if let Some(target_index) = (*index).checked_sub(n) {
+                // SAFETY: target_index <= index < list.len() guarantees in bounds
+                let item = unsafe { list.get_item_unchecked(target_index) };
+                if target_index == 0 {
+                    *exhausted = true;
+                } else {
+                    // cannot underflow as target_index > 0
+                    *index = target_index - 1;
+                }
+                return Some(item);
+            }
+        }
+
+        // n overflows the remaining length of the list;
+        // nth must exhaust all remaining items
+        *exhausted = true;
+        None
+    }
+
+    fn with_critical_section<R>(
+        &mut self,
+        f: impl FnOnce(&mut usize, &mut bool, &Bound<'py, PyList>) -> R,
+    ) -> R {
+        let Self {
+            index,
+            exhausted,
+            list,
+        } = self;
+        crate::sync::critical_section::with_critical_section(list, || f(index, exhausted, list))
+    }
+}
+
+impl<'py> Iterator for BoundListReverseIterator<'py> {
+    type Item = Bound<'py, PyAny>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        // SAFETY: with_critical_section locks the list
+        self.with_critical_section(|index, exhausted, list| unsafe {
+            Self::next_unsynchronized(index, exhausted, list)
         })
     }
 
     #[inline]
     #[cfg(not(feature = "nightly"))]
-    fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
         // SAFETY: with_critical_section locks the list
-        self.with_critical_section(|index, length, list| unsafe {
-            Self::nth_back_unsynchronized(index, length, list, n)
+        self.with_critical_section(|index, exhausted, list| unsafe {
+            Self::nth_unsynchronized(index, exhausted, list, n)
         })
     }
 
     #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        // The list may be resized by other Python code while this iterator is alive, so the number
+        // of remaining items may be zero. The iteration position only ever decreases, so it is an
+        // upper bound on the number of items still to be yielded.
+        let remaining = if self.exhausted {
+            0
+        } else {
+            // cannot overflow as `index` is only ever set to `list.len() - 1`
+            self.index.saturating_add(1)
+        };
+        (0, Some(remaining))
+    }
+
+    #[inline]
     #[cfg(all(Py_GIL_DISABLED, not(Py_LIMITED_API), not(feature = "nightly")))]
-    fn rfold<B, F>(mut self, init: B, mut f: F) -> B
+    fn fold<B, F>(mut self, init: B, mut f: F) -> B
     where
         Self: Sized,
         F: FnMut(B, Self::Item) -> B,
     {
-        self.with_critical_section(|index, length, list| {
+        self.with_critical_section(|index, exhausted, list| {
             let mut accum = init;
             // SAFETY: with_critical_section locks the list
-            while let Some(x) = unsafe { Self::next_back_unsynchronized(index, length, list) } {
+            while let Some(x) = unsafe { Self::next_unsynchronized(index, exhausted, list) } {
                 accum = f(accum, x);
             }
             accum
@@ -817,16 +907,16 @@ impl DoubleEndedIterator for BoundListIterator<'_> {
 
     #[inline]
     #[cfg(all(Py_GIL_DISABLED, not(Py_LIMITED_API), feature = "nightly"))]
-    fn try_rfold<B, F, R>(&mut self, init: B, mut f: F) -> R
+    fn try_fold<B, F, R>(&mut self, init: B, mut f: F) -> R
     where
         Self: Sized,
         F: FnMut(B, Self::Item) -> R,
         R: core::ops::Try<Output = B>,
     {
-        self.with_critical_section(|index, length, list| {
+        self.with_critical_section(|index, exhausted, list| {
             let mut accum = init;
             // SAFETY: with_critical_section locks the list
-            while let Some(x) = unsafe { Self::next_back_unsynchronized(index, length, list) } {
+            while let Some(x) = unsafe { Self::next_unsynchronized(index, exhausted, list) } {
                 accum = f(accum, x)?
             }
             R::from_output(accum)
@@ -834,31 +924,133 @@ impl DoubleEndedIterator for BoundListIterator<'_> {
     }
 
     #[inline]
+    #[cfg(all(Py_GIL_DISABLED, not(Py_LIMITED_API), not(feature = "nightly")))]
+    fn all<F>(&mut self, mut f: F) -> bool
+    where
+        Self: Sized,
+        F: FnMut(Self::Item) -> bool,
+    {
+        self.with_critical_section(|index, exhausted, list| {
+            // SAFETY: with_critical_section locks the list
+            while let Some(x) = unsafe { Self::next_unsynchronized(index, exhausted, list) } {
+                if !f(x) {
+                    return false;
+                }
+            }
+            true
+        })
+    }
+
+    #[inline]
+    #[cfg(all(Py_GIL_DISABLED, not(Py_LIMITED_API), not(feature = "nightly")))]
+    fn any<F>(&mut self, mut f: F) -> bool
+    where
+        Self: Sized,
+        F: FnMut(Self::Item) -> bool,
+    {
+        self.with_critical_section(|index, exhausted, list| {
+            // SAFETY: with_critical_section locks the list
+            while let Some(x) = unsafe { Self::next_unsynchronized(index, exhausted, list) } {
+                if f(x) {
+                    return true;
+                }
+            }
+            false
+        })
+    }
+
+    #[inline]
+    #[cfg(all(Py_GIL_DISABLED, not(Py_LIMITED_API), not(feature = "nightly")))]
+    fn find<P>(&mut self, mut predicate: P) -> Option<Self::Item>
+    where
+        Self: Sized,
+        P: FnMut(&Self::Item) -> bool,
+    {
+        self.with_critical_section(|index, exhausted, list| {
+            // SAFETY: with_critical_section locks the list
+            while let Some(x) = unsafe { Self::next_unsynchronized(index, exhausted, list) } {
+                if predicate(&x) {
+                    return Some(x);
+                }
+            }
+            None
+        })
+    }
+
+    #[inline]
+    #[cfg(all(Py_GIL_DISABLED, not(Py_LIMITED_API), not(feature = "nightly")))]
+    fn find_map<B, F>(&mut self, mut f: F) -> Option<B>
+    where
+        Self: Sized,
+        F: FnMut(Self::Item) -> Option<B>,
+    {
+        self.with_critical_section(|index, exhausted, list| {
+            // SAFETY: with_critical_section locks the list
+            while let Some(x) = unsafe { Self::next_unsynchronized(index, exhausted, list) } {
+                if let found @ Some(_) = f(x) {
+                    return found;
+                }
+            }
+            None
+        })
+    }
+
+    #[inline]
+    #[cfg(all(Py_GIL_DISABLED, not(Py_LIMITED_API), not(feature = "nightly")))]
+    fn position<P>(&mut self, mut predicate: P) -> Option<usize>
+    where
+        Self: Sized,
+        P: FnMut(Self::Item) -> bool,
+    {
+        self.with_critical_section(|index, exhausted, list| {
+            let mut acc = 0;
+            // SAFETY: with_critical_section locks the list
+            while let Some(x) = unsafe { Self::next_unsynchronized(index, exhausted, list) } {
+                if predicate(x) {
+                    return Some(acc);
+                }
+                acc += 1;
+            }
+            None
+        })
+    }
+
+    #[inline]
     #[cfg(feature = "nightly")]
-    fn advance_back_by(&mut self, n: usize) -> Result<(), NonZero<usize>> {
-        self.with_critical_section(|index, length, list| {
-            let current_length = length.0.min(list.len());
-            let items_left = current_length.saturating_sub(index.0);
+    fn advance_by(&mut self, n: usize) -> Result<(), NonZero<usize>> {
+        self.with_critical_section(|index, exhausted, list| {
+            if *exhausted {
+                return if n == 0 {
+                    Ok(())
+                } else {
+                    Err(NonZero::new(n).expect("n is nonzero"))
+                };
+            }
+
+            let items_left = if *index < list.len() {
+                // cannot overflow as index < list.len()
+                *index + 1
+            } else {
+                // the list has shrunk below the iteration position; this exhausts the iterator
+                0
+            };
+
             if let Some(overflow) = NonZero::new(n.saturating_sub(items_left)) {
-                // n overflows the remaining length of the list; advance_back_by must exhaust all remaining items
-                length.0 = index.0;
+                // n overflows the remaining length of the list; advance_by must exhaust all remaining items
+                *exhausted = true;
                 return Err(overflow);
             }
 
-            // cannot overflow as current_length - index >= n
-            length.0 = current_length - n;
+            if n == items_left {
+                *exhausted = true;
+            } else {
+                // cannot underflow as n < items_left <= index + 1
+                *index -= n;
+            }
             Ok(())
         })
     }
 }
-
-impl ExactSizeIterator for BoundListIterator<'_> {
-    fn len(&self) -> usize {
-        self.length.0.saturating_sub(self.index.0)
-    }
-}
-
-impl FusedIterator for BoundListIterator<'_> {}
 
 impl<'py> IntoIterator for Bound<'py, PyList> {
     type Item = Bound<'py, PyAny>;
@@ -1035,46 +1227,126 @@ mod tests {
     #[test]
     fn test_iter_size_hint() {
         Python::attach(|py| {
-            let v = vec![2, 3, 5, 7];
-            let ob = (&v).into_pyobject(py).unwrap();
-            let list = ob.cast::<PyList>().unwrap();
+            let list = PyList::new(py, [2, 3, 5, 7]).unwrap();
 
             let mut iter = list.iter();
-            assert_eq!(iter.size_hint(), (v.len(), Some(v.len())));
+            // the list may be resized during iteration, so there is no useful hint
+            assert_eq!(iter.size_hint(), (0, None));
             iter.next();
-            assert_eq!(iter.size_hint(), (v.len() - 1, Some(v.len() - 1)));
+            assert_eq!(iter.size_hint(), (0, None));
 
             // Exhaust iterator.
             for _ in &mut iter {}
 
-            assert_eq!(iter.size_hint(), (0, Some(0)));
+            assert_eq!(iter.size_hint(), (0, None));
         });
     }
 
     #[test]
     fn test_iter_rev() {
         Python::attach(|py| {
-            let v = vec![2, 3, 5, 7];
-            let ob = v.into_pyobject(py).unwrap();
-            let list = ob.cast::<PyList>().unwrap();
+            let list = PyList::new(py, [2, 3, 5, 7]).unwrap();
 
-            let mut iter = list.iter().rev();
+            let mut iter = list.iter_rev();
 
-            assert_eq!(iter.size_hint(), (4, Some(4)));
+            // the list may shrink during iteration, so the lower bound is 0 and the position
+            // captured at creation bounds the number of remaining items
+            assert_eq!(iter.size_hint(), (0, Some(4)));
 
             assert_eq!(iter.next().unwrap().extract::<i32>().unwrap(), 7);
-            assert_eq!(iter.size_hint(), (3, Some(3)));
+            assert_eq!(iter.size_hint(), (0, Some(3)));
 
             assert_eq!(iter.next().unwrap().extract::<i32>().unwrap(), 5);
-            assert_eq!(iter.size_hint(), (2, Some(2)));
+            assert_eq!(iter.size_hint(), (0, Some(2)));
 
             assert_eq!(iter.next().unwrap().extract::<i32>().unwrap(), 3);
-            assert_eq!(iter.size_hint(), (1, Some(1)));
+            assert_eq!(iter.size_hint(), (0, Some(1)));
 
             assert_eq!(iter.next().unwrap().extract::<i32>().unwrap(), 2);
             assert_eq!(iter.size_hint(), (0, Some(0)));
 
             assert!(iter.next().is_none());
+            assert!(iter.next().is_none());
+        });
+    }
+
+    #[test]
+    fn test_iter_rev_empty() {
+        Python::attach(|py| {
+            let list = PyList::new(py, Vec::<i32>::new()).unwrap();
+
+            let mut iter = list.iter_rev();
+            assert_eq!(iter.size_hint(), (0, Some(0)));
+            assert!(iter.next().is_none());
+            assert!(iter.next().is_none());
+        });
+    }
+
+    #[test]
+    fn test_iter_appended_during_iteration() {
+        Python::attach(|py| {
+            let list = PyList::new(py, [1, 2, 3]).unwrap();
+            let mut iter = list.iter();
+
+            assert_eq!(iter.next().unwrap().extract::<i32>().unwrap(), 1);
+            list.append(4).unwrap();
+
+            // like Python, items appended during iteration are yielded
+            assert_eq!(
+                iter.map(|x| x.extract::<i32>().unwrap())
+                    .collect::<Vec<_>>(),
+                vec![2, 3, 4]
+            );
+        });
+    }
+
+    #[test]
+    fn test_iter_stays_exhausted_after_growth() {
+        Python::attach(|py| {
+            let list = PyList::new(py, [1, 2, 3]).unwrap();
+            let mut iter = list.iter();
+
+            assert!(iter.next().is_some());
+            list.del_slice(0, 3).unwrap();
+            assert!(iter.next().is_none());
+
+            // like Python, an exhausted iterator does not resume when the list grows again
+            list.append(9).unwrap();
+            assert!(iter.next().is_none());
+        });
+    }
+
+    #[test]
+    fn test_iter_rev_snapshots_length() {
+        Python::attach(|py| {
+            let list = PyList::new(py, [1, 2, 3]).unwrap();
+            let mut iter = list.iter_rev();
+
+            assert_eq!(iter.next().unwrap().extract::<i32>().unwrap(), 3);
+            list.append(4).unwrap();
+
+            // like Python, items appended after creating the reverse iterator are not yielded
+            assert_eq!(
+                iter.map(|x| x.extract::<i32>().unwrap())
+                    .collect::<Vec<_>>(),
+                vec![2, 1]
+            );
+        });
+    }
+
+    #[test]
+    fn test_iter_rev_stops_if_list_shrinks() {
+        Python::attach(|py| {
+            let list = PyList::new(py, [1, 2, 3, 4, 5]).unwrap();
+            let mut iter = list.iter_rev();
+
+            assert_eq!(iter.next().unwrap().extract::<i32>().unwrap(), 5);
+            // remove items up to and including the iteration position
+            list.del_slice(0, 3).unwrap();
+            assert!(iter.next().is_none());
+
+            // like Python, an exhausted iterator does not resume when the list grows again
+            list.append(9).unwrap();
             assert!(iter.next().is_none());
         });
     }
@@ -1169,13 +1441,14 @@ mod tests {
     }
 
     #[test]
-    fn test_iter_rfold() {
+    fn test_iter_rev_fold() {
         Python::attach(|py: Python<'_>| {
             let list = PyList::new(py, [1, 2, 3]).unwrap();
-            let sum = list
-                .iter()
-                .rfold(0, |acc, v| acc + v.extract::<usize>().unwrap());
-            assert_eq!(sum, 6);
+            let items = list.iter_rev().fold(Vec::new(), |mut acc, v| {
+                acc.push(v.extract::<usize>().unwrap());
+                acc
+            });
+            assert_eq!(items, vec![3, 2, 1]);
         });
     }
 
@@ -1199,19 +1472,22 @@ mod tests {
     }
 
     #[test]
-    fn test_iter_try_rfold() {
+    fn test_iter_rev_try_fold() {
         Python::attach(|py: Python<'_>| {
             let list = PyList::new(py, [1, 2, 3]).unwrap();
-            let sum = list
-                .iter()
-                .try_rfold(0, |acc, v| PyResult::Ok(acc + v.extract::<usize>()?))
+            let items = list
+                .iter_rev()
+                .try_fold(Vec::new(), |mut acc, v| {
+                    acc.push(v.extract::<usize>()?);
+                    PyResult::Ok(acc)
+                })
                 .unwrap();
-            assert_eq!(sum, 6);
+            assert_eq!(items, vec![3, 2, 1]);
 
             let list = PyList::new(py, ["foo", "bar"]).unwrap();
             assert!(
-                list.iter()
-                    .try_rfold(0, |acc, v| PyResult::Ok(acc + v.extract::<usize>()?))
+                list.iter_rev()
+                    .try_fold(0, |acc, v| PyResult::Ok(acc + v.extract::<usize>()?))
                     .is_err()
             );
         });
@@ -1577,16 +1853,10 @@ mod tests {
             assert_eq!(iter.nth(2).unwrap().extract::<i32>().unwrap(), 9);
             assert_eq!(iter.next().unwrap().extract::<i32>().unwrap(), 10);
 
-            let mut iter = list.iter();
-            assert_eq!(iter.nth_back(1).unwrap().extract::<i32>().unwrap(), 9);
-            assert_eq!(iter.nth(2).unwrap().extract::<i32>().unwrap(), 8);
-            assert!(iter.next().is_none());
-
             // nth consumes all elements in the list, even on `None` return
             let mut iter = list.iter();
             assert!(iter.nth(100).is_none());
             assert!(iter.next().is_none());
-            assert!(iter.next_back().is_none());
 
             // nth should not overflow the iterator
             // a naive implementation of nth will overflow if number of advanced
@@ -1598,70 +1868,56 @@ mod tests {
     }
 
     #[test]
-    fn test_iter_nth_back() {
+    fn test_iter_rev_nth() {
         Python::attach(|py| {
             let v = vec![1, 2, 3, 4, 5];
             let ob = (&v).into_pyobject(py).unwrap();
             let list = ob.cast::<PyList>().unwrap();
 
-            let mut iter = list.iter();
-            assert_eq!(iter.nth_back(0).unwrap().extract::<i32>().unwrap(), 5);
-            assert_eq!(iter.nth_back(1).unwrap().extract::<i32>().unwrap(), 3);
-            assert!(iter.nth_back(2).is_none());
+            let mut iter = list.iter_rev();
+            assert_eq!(iter.nth(1).unwrap().extract::<i32>().unwrap(), 4);
+            assert_eq!(iter.nth(1).unwrap().extract::<i32>().unwrap(), 2);
+            assert!(iter.nth(2).is_none());
 
             let v: Vec<i32> = vec![];
             let ob = (&v).into_pyobject(py).unwrap();
             let list = ob.cast::<PyList>().unwrap();
 
-            let mut iter = list.iter();
-            assert!(iter.nth_back(0).is_none());
-            assert!(iter.nth_back(1).is_none());
+            let mut iter = list.iter_rev();
+            assert!(iter.nth(1).is_none());
+            assert!(iter.nth(1).is_none());
 
             let v = vec![1, 2, 3];
             let ob = (&v).into_pyobject(py).unwrap();
             let list = ob.cast::<PyList>().unwrap();
 
-            let mut iter = list.iter();
-            assert!(iter.nth_back(5).is_none());
+            let mut iter = list.iter_rev();
+            assert!(iter.nth(5).is_none());
 
             let v = vec![1, 2, 3, 4, 5];
             let ob = (&v).into_pyobject(py).unwrap();
             let list = ob.cast::<PyList>().unwrap();
 
-            let mut iter = list.iter();
-            iter.next_back(); // Consume the last element
-            assert_eq!(iter.nth_back(1).unwrap().extract::<i32>().unwrap(), 3);
-            assert_eq!(iter.next_back().unwrap().extract::<i32>().unwrap(), 2);
-            assert_eq!(iter.nth_back(0).unwrap().extract::<i32>().unwrap(), 1);
+            let mut iter = list.iter_rev();
+            iter.next(); // Consume the last element
+            assert_eq!(iter.nth(1).unwrap().extract::<i32>().unwrap(), 3);
+            assert_eq!(iter.next().unwrap().extract::<i32>().unwrap(), 2);
+            assert_eq!(iter.next().unwrap().extract::<i32>().unwrap(), 1);
 
-            let v = vec![1, 2, 3, 4, 5];
-            let ob = (&v).into_pyobject(py).unwrap();
-            let list = ob.cast::<PyList>().unwrap();
+            let mut iter2 = list.iter_rev();
+            iter2.next();
+            assert_eq!(iter2.nth(1).unwrap().extract::<i32>().unwrap(), 3);
+            assert_eq!(iter2.next().unwrap().extract::<i32>().unwrap(), 2);
 
-            let mut iter = list.iter();
-            assert_eq!(iter.nth_back(1).unwrap().extract::<i32>().unwrap(), 4);
-            assert_eq!(iter.nth_back(2).unwrap().extract::<i32>().unwrap(), 1);
-
-            let mut iter2 = list.iter();
-            iter2.next_back();
-            assert_eq!(iter2.nth_back(1).unwrap().extract::<i32>().unwrap(), 3);
-            assert_eq!(iter2.next_back().unwrap().extract::<i32>().unwrap(), 2);
-
-            let mut iter3 = list.iter();
-            iter3.nth(1);
-            assert_eq!(iter3.nth_back(2).unwrap().extract::<i32>().unwrap(), 3);
-            assert!(iter3.nth_back(0).is_none());
-
-            // nth_back consumes all elements in the list, even on `None` return
-            let mut iter4 = list.iter();
-            assert!(iter4.nth_back(100).is_none());
-            assert!(iter4.next_back().is_none());
+            // nth consumes all elements in the list, even on `None` return
+            let mut iter4 = list.iter_rev();
+            assert!(iter4.nth(100).is_none());
             assert!(iter4.next().is_none());
 
-            // nth_back should not overflow with usize::MAX
-            let mut iter5 = list.iter();
-            iter5.nth(1); //
-            assert!(iter5.nth_back(usize::MAX).is_none());
+            // nth should not overflow with usize::MAX
+            let mut iter5 = list.iter_rev();
+            iter5.next();
+            assert!(iter5.nth(usize::MAX).is_none());
         });
     }
 
@@ -1706,40 +1962,66 @@ mod tests {
 
     #[cfg(feature = "nightly")]
     #[test]
-    fn test_iter_advance_back_by() {
+    fn test_iter_rev_advance_by() {
         Python::attach(|py| {
             let v = vec![1, 2, 3, 4, 5];
             let ob = (&v).into_pyobject(py).unwrap();
             let list = ob.cast::<PyList>().unwrap();
 
-            let mut iter = list.iter();
-            assert_eq!(iter.advance_back_by(2), Ok(()));
-            assert_eq!(iter.next_back().unwrap().extract::<i32>().unwrap(), 3);
-            assert_eq!(iter.advance_back_by(0), Ok(()));
-            assert_eq!(iter.advance_back_by(100), Err(NonZero::new(98).unwrap()));
+            let mut iter = list.iter_rev();
+            assert_eq!(iter.advance_by(2), Ok(()));
+            assert_eq!(iter.next().unwrap().extract::<i32>().unwrap(), 3);
+            assert_eq!(iter.advance_by(0), Ok(()));
+            assert_eq!(iter.advance_by(100), Err(NonZero::new(98).unwrap()));
 
-            let mut iter2 = list.iter();
-            assert_eq!(iter2.advance_back_by(6), Err(NonZero::new(1).unwrap()));
+            let mut iter2 = list.iter_rev();
+            assert_eq!(iter2.advance_by(6), Err(NonZero::new(1).unwrap()));
 
-            let mut iter3 = list.iter();
-            assert_eq!(iter3.advance_back_by(5), Ok(()));
+            let mut iter3 = list.iter_rev();
+            assert_eq!(iter3.advance_by(5), Ok(()));
+            assert!(iter3.next().is_none());
 
-            let mut iter4 = list.iter();
-            assert_eq!(iter4.advance_back_by(0), Ok(()));
-            assert_eq!(iter4.next_back().unwrap().extract::<i32>().unwrap(), 5);
+            let mut iter4 = list.iter_rev();
+            assert_eq!(iter4.advance_by(0), Ok(()));
+            assert_eq!(iter4.next().unwrap().extract::<i32>().unwrap(), 5);
 
-            // advance_back_by should not overflow with usize::MAX
+            // advance_by should not overflow with usize::MAX
             // - first advance will overflow by MAX - len, and will exhaust the iterator
             // - second advance will overflow by MAX
-            let mut iter5 = list.iter();
+            let mut iter5 = list.iter_rev();
             assert_eq!(
-                iter5.advance_back_by(usize::MAX),
+                iter5.advance_by(usize::MAX),
                 Err(NonZero::new(usize::MAX - list.len()).unwrap())
             );
             assert_eq!(
-                iter5.advance_back_by(usize::MAX),
+                iter5.advance_by(usize::MAX),
                 Err(NonZero::new(usize::MAX).unwrap())
             );
+
+            // advancing by zero on an exhausted iterator is a no-op
+            let mut iter6 = list.iter_rev();
+            assert_eq!(iter6.advance_by(5), Ok(()));
+            assert!(iter6.next().is_none());
+            assert_eq!(iter6.advance_by(0), Ok(()));
+            assert_eq!(iter6.advance_by(1), Err(NonZero::new(1).unwrap()));
+        })
+    }
+
+    #[test]
+    fn test_iter_nth_exhausts() {
+        Python::attach(|py| {
+            let list = PyList::new(py, [1, 2, 3]).unwrap();
+
+            let mut iter = list.iter();
+            assert!(iter.nth(10).is_none());
+            list.append(4).unwrap();
+            // `nth` which runs off the end exhausts the iterator, like `next`
+            assert!(iter.next().is_none());
+
+            let mut iter = list.iter_rev();
+            assert!(iter.nth(10).is_none());
+            list.append(5).unwrap();
+            assert!(iter.next().is_none());
         })
     }
 
@@ -1749,6 +2031,10 @@ mod tests {
             let list = PyList::new(py, vec![1, 2, 3]).unwrap();
             let last = list.iter().last();
             assert_eq!(last.unwrap().extract::<i32>().unwrap(), 3);
+
+            // `last` on the reverse iterator is the first item of the list
+            let first = list.iter_rev().last();
+            assert_eq!(first.unwrap().extract::<i32>().unwrap(), 1);
         })
     }
 

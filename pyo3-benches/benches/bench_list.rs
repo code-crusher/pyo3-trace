@@ -53,14 +53,14 @@ fn list_nth(b: &mut Bencher<'_>) {
     });
 }
 
-fn list_nth_back(b: &mut Bencher<'_>) {
+fn list_nth_rev(b: &mut Bencher<'_>) {
     Python::attach(|py| {
         const LEN: usize = 50;
         let list = PyList::new(py, 0..LEN).unwrap();
         let mut sum = 0;
         b.iter(|| {
             for i in 0..LEN {
-                sum += list.iter().nth_back(i).unwrap().extract::<usize>().unwrap();
+                sum += list.iter_rev().nth(i).unwrap().extract::<usize>().unwrap();
             }
         });
     });
@@ -96,7 +96,7 @@ fn criterion_benchmark(c: &mut Criterion) {
     c.bench_function("iter_list", iter_list);
     c.bench_function("list_new", list_new);
     c.bench_function("list_nth", list_nth);
-    c.bench_function("list_nth_back", list_nth_back);
+    c.bench_function("list_nth_rev", list_nth_rev);
     c.bench_function("list_get_item", list_get_item);
     c.bench_function("list_get_item_unchecked", list_get_item_unchecked);
     c.bench_function("sequence_from_list", sequence_from_list);
