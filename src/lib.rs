@@ -351,7 +351,7 @@ pub use crate::instance::{Borrowed, Bound, BoundObject, Py};
 #[cfg(not(any(PyPy, GraalPy)))]
 pub use crate::interpreter_lifecycle::with_embedded_python_interpreter;
 pub use crate::marker::Python;
-pub use crate::pycell::{PyRef, PyRefMut};
+pub use crate::pycell::{PyRef, PyRefMut, PyRefMutSuper};
 pub use crate::pyclass::{PyClass, PyClassGuard, PyClassGuardMut};
 pub use crate::pyclass_init::PyClassInitializer;
 pub use crate::type_object::{PyTypeCheck, PyTypeInfo};

@@ -1,0 +1,19 @@
+error[E0308]: mismatched types
+   --> tests/ui/pyrefmut_as_super_swap.rs:21:9
+    |
+ 20 |     std::mem::swap(
+    |     -------------- arguments to this function are incorrect
+ 21 |         sub.as_super(),
+    |         ^^^^^^^^^^^^^^ expected `&mut PyRefMut<'_, BaseClass>`, found `PyRefMutSuper<'_, '_, BaseClass>`
+    |
+    = note: expected mutable reference `&mut pyo3::PyRefMut<'_, BaseClass>`
+                          found struct `PyRefMutSuper<'_, '_, BaseClass>`
+note: function defined here
+   --> $RUST_SRC/library/core/src/mem/mod.rs:830:14
+    |
+830 | pub const fn swap<T>(x: &mut T, y: &mut T) {
+    |              ^^^^
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0308`.

@@ -547,13 +547,22 @@ where
     }
 }
 
-impl<T> AsMut<T::BaseType> for PyRefMut<'_, T>
+impl<'p, T> AsMut<T::BaseType> for PyRefMut<'p, T>
 where
     T: PyClass<Frozen = False>,
     T::BaseType: PyClass<Frozen = False>,
 {
     fn as_mut(&mut self) -> &mut T::BaseType {
-        self.as_super()
+        // SAFETY: `Bound<T>` has the same layout as `Bound<T::BaseType>`, and the
+        // mutable borrow on `self` prevents aliasing
+        let bound = unsafe {
+            NonNull::from(&mut self.inner)
+                .cast::<Bound<'p, T::BaseType>>()
+                .as_mut()
+        };
+        // SAFETY: a mutable borrow of the base type is held by `self` for as
+        // long as the returned reference lives
+        unsafe { &mut *bound.get_class_object().get_ptr() }
     }
 }
 
@@ -630,15 +639,16 @@ where
     /// can also be chained to access the super-superclass (and so on).
     ///
     /// See [`PyRef::as_super`] for more.
-    pub fn as_super(&mut self) -> &mut PyRefMut<'p, T::BaseType> {
-        let mut ptr = NonNull::from(&mut self.inner)
-            // `Bound<T>` has the same layout as `Bound<T::BaseType>`
-            .cast::<Bound<'p, T::BaseType>>()
-            // `Bound<T::BaseType>` has the same layout as `PyRefMut<T::BaseType>`,
+    ///
+    /// # Note
+    ///
+    /// The mutable reference to the base type is not exposed directly, but through [`PyRefMutSuper`].
+    pub fn as_super(&mut self) -> PyRefMutSuper<'_, 'p, T::BaseType> {
+        PyRefMutSuper {
+            // SAFETY: `PyRefMut<T>` and `PyRefMut<U>` have the same layout,
             // and the mutable borrow on `self` prevents aliasing
-            .cast::<PyRefMut<'p, T::BaseType>>();
-        // SAFETY: lifetimes are correctly transferred, and `PyRefMut<T>` and `PyRefMut<U>` have the same layout
-        unsafe { ptr.as_mut() }
+            guard: unsafe { NonNull::from(self).cast().as_mut() },
+        }
     }
 }
 
@@ -704,6 +714,56 @@ impl<'py, T: PyClass<Frozen = False>> TryFrom<&Bound<'py, T>> for PyRefMut<'py, 
     #[inline]
     fn try_from(value: &Bound<'py, T>) -> Result<Self, Self::Error> {
         PyRefMut::try_borrow(value)
+    }
+}
+
+/// Wraps a borrowed mutable reference to the base class `T::BaseType` of a PyClass `T`
+///
+/// See [`PyRefMut::as_super`]
+#[repr(transparent)]
+pub struct PyRefMutSuper<'a, 'p, T: PyClass<Frozen = False>> {
+    // NOTE: Exposing this directly from `PyRefMut::as_super` would allow swapping this
+    // `guard` with another guard of the same basetype but different subtype. That is unsound as the
+    // original `PyRefMut` allows access to the `T` stored inside. By wrapping the guard in a
+    // new type which does not expose a mutable reference to the guard directly we ensure that this
+    // swap is impossible.
+    guard: &'a mut PyRefMut<'p, T>,
+}
+
+impl<'a, 'p, T> PyRefMutSuper<'a, 'p, T>
+where
+    T: PyClass<Frozen = False>,
+    T::BaseType: PyClass<Frozen = False>,
+{
+    /// Borrows a mutable reference to `PyRefMut<T::BaseType>`.
+    ///
+    /// See [`PyRefMut::as_super`] for more.
+    pub fn as_super(&mut self) -> PyRefMutSuper<'_, 'p, T::BaseType> {
+        // SAFETY: `PyRefMut<T>` and `PyRefMut<U>` have the same layout,
+        // and the mutable borrow on `self.guard` prevents aliasing
+        PyRefMutSuper {
+            guard: unsafe { NonNull::from(&mut *self.guard).cast().as_mut() },
+        }
+    }
+}
+
+impl<T> Deref for PyRefMutSuper<'_, '_, T>
+where
+    T: PyClass<Frozen = False>,
+{
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        unsafe { &*self.guard.inner.get_class_object().get_ptr() }
+    }
+}
+
+impl<T> DerefMut for PyRefMutSuper<'_, '_, T>
+where
+    T: PyClass<Frozen = False>,
+{
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.guard.inner.get_class_object().get_ptr() }
     }
 }
 
@@ -867,7 +927,7 @@ mod tests {
             assert_eq!(SubSubClass::get_values(obj.borrow()), (10, 15, 20));
             {
                 let mut pyrefmut = obj.borrow_mut();
-                assert_eq!(pyrefmut.as_super().as_ref().val1, 10);
+                assert_eq!(pyrefmut.as_super().as_super().val1, 10);
                 pyrefmut.as_super().as_super().val1 -= 5;
                 pyrefmut.as_super().val2 -= 3;
                 pyrefmut.as_mut().val2 -= 2; // `as_mut` also works
@@ -876,6 +936,30 @@ mod tests {
             assert_eq!(SubSubClass::get_values(obj.borrow()), (5, 10, 15));
             SubSubClass::double_values(obj.borrow_mut());
             assert_eq!(SubSubClass::get_values(obj.borrow()), (10, 20, 30));
+        });
+    }
+
+    #[test]
+    fn test_pyrefmut_as_super_no_swap() {
+        // `PyRefMut::as_super` returns a `PyRefMutSuper` wrapper rather than a
+        // `&mut PyRefMut<T::BaseType>`; this makes it impossible to swap the
+        // super-guard with a guard borrowed from an actual instance of the base
+        // type, which previously would have caused type confusion (issue #6083).
+        Python::attach(|py| {
+            let obj = SubSubClass::new(py).into_bound(py);
+            let base_obj = Bound::new(py, BaseClass { val1: 5 }).unwrap();
+
+            let mut obj_guard_mut = obj.borrow_mut();
+            let mut base_guard_mut = base_obj.borrow_mut();
+
+            obj_guard_mut.as_super().as_super().val1 += 1;
+            base_guard_mut.val1 += 2;
+
+            // the guards mutate their own objects, independently
+            drop(obj_guard_mut);
+            drop(base_guard_mut);
+            assert_eq!(obj.borrow().as_super().as_super().val1, 11);
+            assert_eq!(base_obj.borrow().val1, 7);
         });
     }
 

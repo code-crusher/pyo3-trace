@@ -417,7 +417,7 @@ Currently, only classes defined in Rust and builtins provided by PyO3 can be inh
 To initialize a class, which inherits from another class, use the `PyClassInitializer` API.
 
 To get a parent class from a child, use [`PyRef`] instead of `&self` for methods, or [`PyRefMut`] instead of `&mut self`.
-Then you can access a parent class by `self_.as_super()` as `&PyRef<Self::BaseClass>`, or by `self_.into_super()` as `PyRef<Self::BaseClass>` (and similar for the `PyRefMut` case).
+Then you can access a parent class by `self_.as_super()` as `&PyRef<Self::BaseClass>`, or by `self_.into_super()` as `PyRef<Self::BaseClass>` (and similar for the `PyRefMut` case, where `as_super` returns a [`PyRefMutSuper`] which derefs to the base class).
 For convenience, `self_.as_ref()` can also be used to get `&Self::BaseClass` directly; however, this approach does not let you access base classes higher in the inheritance hierarchy, for which you would need to chain multiple `as_super` or `into_super` calls.
 
 ```rust
@@ -1579,6 +1579,7 @@ impl pyo3::impl_::pyclass::PyClassImpl for MyClass {
 [`PyClass`]: {{#PYO3_DOCS_URL}}/pyo3/pyclass/trait.PyClass.html
 [`PyRef`]: {{#PYO3_DOCS_URL}}/pyo3/pycell/struct.PyRef.html
 [`PyRefMut`]: {{#PYO3_DOCS_URL}}/pyo3/pycell/struct.PyRefMut.html
+[`PyRefMutSuper`]: {{#PYO3_DOCS_URL}}/pyo3/pycell/struct.PyRefMutSuper.html
 [`PyClassInitializer<T>`]: {{#PYO3_DOCS_URL}}/pyo3/pyclass_init/struct.PyClassInitializer.html
 
 [`Arc`]: https://doc.rust-lang.org/std/sync/struct.Arc.html
