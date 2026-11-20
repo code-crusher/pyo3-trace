@@ -385,10 +385,12 @@ fn rhs_arithmetic() {
         py_run!(py, c, "assert 1 | c == '1 | RA'");
         py_run!(py, c, "assert c.__rpow__(1) == '1 ** RA'");
         py_run!(py, c, "assert 1 ** c == '1 ** RA'");
+        // same-type operands still fall back to the reflected method
+        py_run!(py, c, "assert (c + c).endswith('+ RA')");
     });
 }
 
-#[pyclass]
+#[pyclass(subclass)]
 struct LhsAndRhs {}
 
 impl std::fmt::Debug for LhsAndRhs {
@@ -518,6 +520,179 @@ fn lhs_fellback_to_rhs() {
         py_run!(py, c, "assert 1 | c == '1 | RA'");
         py_run!(py, c, "assert 1 ** c == '1 ** RA'");
         py_run!(py, c, "assert 1 @ c == '1 @ RA'");
+    });
+}
+
+#[pyclass(extends = LhsAndRhs)]
+struct OverrideRhs {}
+
+#[pymethods]
+impl OverrideRhs {
+    fn __radd__(&self, other: &Bound<'_, PyAny>) -> String {
+        format!("{other:?} + OverrideRhs")
+    }
+}
+
+#[test]
+fn override_rhs() {
+    Python::attach(|py| {
+        let c = Py::new(py, LhsAndRhs {}).unwrap();
+        let sub = Py::new(py, (OverrideRhs {}, LhsAndRhs {})).unwrap();
+        py_run!(py, c sub, "assert 1 + sub == '1 + OverrideRhs'");
+        // `__add__` not overridden, should use `LhsAndRhs.__add__`
+        py_run!(py, c sub, "assert sub + 1 == 'LR + 1'");
+    });
+}
+
+/// Parent implements only `__radd__`; subclass implements only `__add__`.
+#[pyclass(subclass)]
+struct RhsOnlyBase {}
+
+#[pymethods]
+impl RhsOnlyBase {
+    fn __radd__(&self, other: &Bound<'_, PyAny>) -> String {
+        format!("{other:?} + RhsOnlyBase")
+    }
+}
+
+#[pyclass(extends = RhsOnlyBase)]
+struct OverrideLhs {}
+
+#[pymethods]
+impl OverrideLhs {
+    fn __add__(&self, other: &Bound<'_, PyAny>) -> String {
+        format!("OverrideLhs + {other:?}")
+    }
+}
+
+#[test]
+fn override_lhs() {
+    Python::attach(|py| {
+        let sub = Py::new(py, (OverrideLhs {}, RhsOnlyBase {})).unwrap();
+        // `__add__` from the subclass is used for the forward operation
+        py_run!(py, sub, "assert sub + 1 == 'OverrideLhs + 1'");
+        // `__radd__` not overridden, should use `RhsOnlyBase.__radd__`
+        py_run!(py, sub, "assert 1 + sub == '1 + RhsOnlyBase'");
+    });
+}
+
+/// A subclassable class whose only operator implementation is `__add__`; used to
+/// check base-class resolution when mixing with pure-Python mixin classes.
+#[pyclass(subclass)]
+struct ForwardOnly {}
+
+#[pymethods]
+impl ForwardOnly {
+    #[new]
+    fn new() -> Self {
+        ForwardOnly {}
+    }
+
+    fn __add__(&self, other: &Bound<'_, PyAny>) -> String {
+        format!("ForwardOnly.__add__({other:?})")
+    }
+}
+
+/// A subclassable class whose only operator implementation is `__radd__`; used to
+/// check base-class resolution when mixing with pure-Python mixin classes.
+#[pyclass(subclass)]
+struct ReflectedOnly {}
+
+#[pymethods]
+impl ReflectedOnly {
+    #[new]
+    fn new() -> Self {
+        ReflectedOnly {}
+    }
+
+    fn __radd__(&self, other: &Bound<'_, PyAny>) -> String {
+        format!("ReflectedOnly.__radd__({other:?})")
+    }
+}
+
+#[test]
+fn binop_inheritance_rust_forward_python_reflected() {
+    Python::attach(|py| {
+        let forward_type = Py::new(py, ForwardOnly {}).unwrap().bind(py).get_type();
+
+        // Rust base first in the MRO
+        py_run!(
+            py,
+            forward_type,
+            r#"
+class PyReflectedMixin:
+    def __radd__(self, other):
+        return f"PyReflectedMixin.__radd__({other!r})"
+
+class ChildRustFirst(forward_type, PyReflectedMixin):
+    pass
+
+child = ChildRustFirst()
+assert child + 5 == "ForwardOnly.__add__(5)"
+assert 5 + child == "PyReflectedMixin.__radd__(5)"
+"#
+        );
+
+        // Python base first in the MRO
+        py_run!(
+            py,
+            forward_type,
+            r#"
+class PyReflectedMixin2:
+    def __radd__(self, other):
+        return f"PyReflectedMixin.__radd__({other!r})"
+
+class ChildPyFirst(PyReflectedMixin2, forward_type):
+    pass
+
+child = ChildPyFirst()
+assert child + 5 == "ForwardOnly.__add__(5)"
+assert 5 + child == "PyReflectedMixin.__radd__(5)"
+"#
+        );
+    });
+}
+
+#[test]
+fn binop_inheritance_rust_reflected_python_forward() {
+    Python::attach(|py| {
+        let reflected_type = Py::new(py, ReflectedOnly {}).unwrap().bind(py).get_type();
+
+        // Rust base first in the MRO
+        py_run!(
+            py,
+            reflected_type,
+            r#"
+class PyForwardMixin:
+    def __add__(self, other):
+        return f"PyForwardMixin.__add__({other!r})"
+
+class ChildRustFirst(reflected_type, PyForwardMixin):
+    pass
+
+child = ChildRustFirst()
+assert child + 5 == "PyForwardMixin.__add__(5)"
+assert 5 + child == "ReflectedOnly.__radd__(5)"
+"#
+        );
+
+        // Python base first in the MRO
+        py_run!(
+            py,
+            reflected_type,
+            r#"
+class PyForwardMixin2:
+    def __add__(self, other):
+        return f"PyForwardMixin.__add__({other!r})"
+
+class ChildPyFirst(PyForwardMixin2, reflected_type):
+    pass
+
+child = ChildPyFirst()
+assert child + 5 == "PyForwardMixin.__add__(5)"
+assert 5 + child == "ReflectedOnly.__radd__(5)"
+"#
+        );
     });
 }
 

@@ -5,8 +5,8 @@
 use crate::platform::prelude::*;
 use crate::platform::thread;
 use crate::{
-    Borrowed, FromPyObject, IntoPyObject, IntoPyObjectExt, Py, PyAny, PyClass, PyClassGuard, PyErr,
-    PyResult, PyTypeCheck, PyTypeInfo, Python,
+    Borrowed, Bound, FromPyObject, IntoPyObject, IntoPyObjectExt, Py, PyAny, PyClass, PyClassGuard,
+    PyErr, PyResult, PyTypeCheck, PyTypeInfo, Python,
     exceptions::{PyAttributeError, PyNotImplementedError, PyRuntimeError},
     ffi,
     ffi_ptr_ext::FfiPtrExt,
@@ -19,7 +19,7 @@ use crate::{
     internal::pyclass_init::PyObjectInit,
     pycell::{PyBorrowError, impl_::PyClassObjectLayout},
     pyclass::PyClassGuardError,
-    types::{PyBool, any::PyAnyMethods},
+    types::{PyBool, PyString, PySuper, PyType, any::PyAnyMethods},
 };
 
 use core::ops::DerefMut;
@@ -576,6 +576,12 @@ define_pyclass_setattr_slot! {
 /// - Trait for a lhs dunder e.g. __add__
 /// - Trait for the corresponding rhs e.g. __radd__
 /// - A macro which will use dtolnay specialisation to generate the shared slot for the two dunders
+///
+/// The generated slot macro dispatches to the forward or reflected fragment based on the
+/// runtime types of the operands, so that each fragment is only invoked for receivers it
+/// was written for.  When only one arm is implemented by the class itself, the other arm
+/// is looked up on the base class (mirroring Python's method resolution), so that a
+/// subclass which overrides e.g. only `__radd__` still uses the base class' `__add__`.
 macro_rules! define_pyclass_binary_operator_slot {
     (
         $lhs_trait:ident,
@@ -618,21 +624,120 @@ macro_rules! define_pyclass_binary_operator_slot {
         #[doc(hidden)]
         #[macro_export]
         macro_rules! $generate_macro {
-            ($cls:ty) => {{
+            // Both forward and reflected implemented on this class.
+            ($cls:ty, true, true) => {{
                 unsafe fn slot_impl(
                     py: $crate::Python<'_>,
                     _slf: *mut $crate::ffi::PyObject,
                     _other: *mut $crate::ffi::PyObject,
                 ) -> $crate::PyResult<*mut $crate::ffi::PyObject> {
                     use $crate::impl_::pyclass::*;
+                    use $crate::types::PyAnyMethods;
                     let collector = PyClassImplCollector::<$cls>::new();
-                    let lhs_result = unsafe { collector.$lhs(py, _slf, _other) }?;
-                    if lhs_result == unsafe { $crate::ffi::Py_NotImplemented() } {
-                        unsafe { $crate::ffi::Py_DECREF(lhs_result) };
-                        unsafe { collector.$rhs(py, _other, _slf) }
-                    } else {
-                        ::core::result::Result::Ok(lhs_result)
+
+                    let lhs_obj = unsafe { $crate::Bound::from_borrowed_ptr(py, _slf) };
+                    if lhs_obj.is_instance_of::<$cls>() {
+                        return unsafe { collector.$lhs(py, _slf, _other) };
                     }
+
+                    let rhs_obj = unsafe { $crate::Bound::from_borrowed_ptr(py, _other) };
+                    if rhs_obj.is_instance_of::<$cls>() {
+                        return unsafe { collector.$rhs(py, _other, _slf) };
+                    }
+
+                    ::core::result::Result::Ok(py.NotImplemented().into_ptr())
+                }
+
+                $crate::ffi::PyType_Slot {
+                    slot: $crate::ffi::$slot,
+                    pfunc: $crate::impl_::trampoline::get_trampoline_function!(
+                        binaryfunc, slot_impl
+                    ) as $crate::ffi::binaryfunc as _,
+                }
+            }};
+
+            // Only the forward method is implemented on this class; the reflected method
+            // must be resolved on the base class (if any).
+            ($cls:ty, true, false) => {{
+                unsafe fn slot_impl(
+                    py: $crate::Python<'_>,
+                    _slf: *mut $crate::ffi::PyObject,
+                    _other: *mut $crate::ffi::PyObject,
+                ) -> $crate::PyResult<*mut $crate::ffi::PyObject> {
+                    use $crate::impl_::pyclass::*;
+                    use $crate::types::PyAnyMethods;
+                    let collector = PyClassImplCollector::<$cls>::new();
+
+                    let lhs_obj = unsafe { $crate::Bound::from_borrowed_ptr(py, _slf) };
+                    if lhs_obj.is_instance_of::<$cls>() {
+                        return unsafe { collector.$lhs(py, _slf, _other) };
+                    }
+
+                    let rhs_obj = unsafe { $crate::Bound::from_borrowed_ptr(py, _other) };
+                    if rhs_obj.is_instance_of::<$cls>() {
+                        // The reflected operand is our class; let the base class handle
+                        // the reflected call with the class instance as the receiver
+                        // (mirrors Python's method resolution).
+                        let result = $crate::impl_::pyclass::call_base_class_fragment(
+                            py,
+                            &<$cls as $crate::PyTypeInfo>::type_object(py),
+                            &rhs_obj,
+                            $crate::intern!(py, concat!(stringify!($rhs))),
+                            &lhs_obj,
+                            ::core::option::Option::None,
+                        )?;
+                        if let ::core::option::Option::Some(result) = result {
+                            return ::core::result::Result::Ok(result);
+                        }
+                    }
+
+                    ::core::result::Result::Ok(py.NotImplemented().into_ptr())
+                }
+
+                $crate::ffi::PyType_Slot {
+                    slot: $crate::ffi::$slot,
+                    pfunc: $crate::impl_::trampoline::get_trampoline_function!(
+                        binaryfunc, slot_impl
+                    ) as $crate::ffi::binaryfunc as _,
+                }
+            }};
+
+            // Only the reflected method is implemented on this class; the forward method
+            // must be resolved on the base class (if any).
+            ($cls:ty, false, true) => {{
+                unsafe fn slot_impl(
+                    py: $crate::Python<'_>,
+                    _slf: *mut $crate::ffi::PyObject,
+                    _other: *mut $crate::ffi::PyObject,
+                ) -> $crate::PyResult<*mut $crate::ffi::PyObject> {
+                    use $crate::impl_::pyclass::*;
+                    use $crate::types::PyAnyMethods;
+                    let collector = PyClassImplCollector::<$cls>::new();
+
+                    let lhs_obj = unsafe { $crate::Bound::from_borrowed_ptr(py, _slf) };
+                    if lhs_obj.is_instance_of::<$cls>() {
+                        // The forward operand is our class; let the base class handle the
+                        // forward call (mirrors Python's method resolution).
+                        let rhs_obj = unsafe { $crate::Bound::from_borrowed_ptr(py, _other) };
+                        let result = $crate::impl_::pyclass::call_base_class_fragment(
+                            py,
+                            &<$cls as $crate::PyTypeInfo>::type_object(py),
+                            &lhs_obj,
+                            $crate::intern!(py, concat!(stringify!($lhs))),
+                            &rhs_obj,
+                            ::core::option::Option::None,
+                        )?;
+                        if let ::core::option::Option::Some(result) = result {
+                            return ::core::result::Result::Ok(result);
+                        }
+                    }
+
+                    let rhs_obj = unsafe { $crate::Bound::from_borrowed_ptr(py, _other) };
+                    if rhs_obj.is_instance_of::<$cls>() {
+                        return unsafe { collector.$rhs(py, _other, _slf) };
+                    }
+
+                    ::core::result::Result::Ok(py.NotImplemented().into_ptr())
                 }
 
                 $crate::ffi::PyType_Slot {
@@ -799,22 +904,131 @@ slot_fragment_trait! {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! generate_pyclass_pow_slot {
-    ($cls:ty) => {{
-        fn slot_impl(
+    // Both forward and reflected implemented on this class.
+    ($cls:ty, true, true) => {{
+        unsafe fn slot_impl(
             py: $crate::Python<'_>,
             _slf: *mut $crate::ffi::PyObject,
             _other: *mut $crate::ffi::PyObject,
             _mod: *mut $crate::ffi::PyObject,
         ) -> $crate::PyResult<*mut $crate::ffi::PyObject> {
             use $crate::impl_::pyclass::*;
+            use $crate::types::PyAnyMethods;
             let collector = PyClassImplCollector::<$cls>::new();
-            let lhs_result = unsafe { collector.__pow__(py, _slf, _other, _mod) }?;
-            if lhs_result == unsafe { $crate::ffi::Py_NotImplemented() } {
-                unsafe { $crate::ffi::Py_DECREF(lhs_result) };
-                unsafe { collector.__rpow__(py, _other, _slf, _mod) }
-            } else {
-                ::core::result::Result::Ok(lhs_result)
+
+            let lhs_obj = unsafe { $crate::Bound::from_borrowed_ptr(py, _slf) };
+            if lhs_obj.is_instance_of::<$cls>() {
+                return unsafe { collector.__pow__(py, _slf, _other, _mod) };
             }
+
+            let rhs_obj = unsafe { $crate::Bound::from_borrowed_ptr(py, _other) };
+            if rhs_obj.is_instance_of::<$cls>() {
+                return unsafe { collector.__rpow__(py, _other, _slf, _mod) };
+            }
+
+            ::core::result::Result::Ok(py.NotImplemented().into_ptr())
+        }
+
+        $crate::ffi::PyType_Slot {
+            slot: $crate::ffi::Py_nb_power,
+            pfunc: $crate::impl_::trampoline::get_trampoline_function!(ternaryfunc, slot_impl)
+                as $crate::ffi::ternaryfunc as _,
+        }
+    }};
+
+    // Only the forward method is implemented on this class; the reflected method
+    // must be resolved on the base class (if any).
+    ($cls:ty, true, false) => {{
+        unsafe fn slot_impl(
+            py: $crate::Python<'_>,
+            _slf: *mut $crate::ffi::PyObject,
+            _other: *mut $crate::ffi::PyObject,
+            _mod: *mut $crate::ffi::PyObject,
+        ) -> $crate::PyResult<*mut $crate::ffi::PyObject> {
+            use $crate::impl_::pyclass::*;
+            use $crate::types::PyAnyMethods;
+            let collector = PyClassImplCollector::<$cls>::new();
+
+            let lhs_obj = unsafe { $crate::Bound::from_borrowed_ptr(py, _slf) };
+            if lhs_obj.is_instance_of::<$cls>() {
+                return unsafe { collector.__pow__(py, _slf, _other, _mod) };
+            }
+
+            let rhs_obj = unsafe { $crate::Bound::from_borrowed_ptr(py, _other) };
+            if rhs_obj.is_instance_of::<$cls>() {
+                // The reflected operand is our class; let the base class handle the
+                // reflected call with the class instance as the receiver (mirrors
+                // Python's method resolution).
+                let mod_obj = if _mod.is_null() {
+                    py.None().into_bound(py)
+                } else {
+                    unsafe { $crate::Bound::from_borrowed_ptr(py, _mod) }
+                };
+                let result = $crate::impl_::pyclass::call_base_class_fragment(
+                    py,
+                    &<$cls as $crate::PyTypeInfo>::type_object(py),
+                    &rhs_obj,
+                    $crate::intern!(py, "__rpow__"),
+                    &lhs_obj,
+                    ::core::option::Option::Some(&mod_obj),
+                )?;
+                if let ::core::option::Option::Some(result) = result {
+                    return ::core::result::Result::Ok(result);
+                }
+            }
+
+            ::core::result::Result::Ok(py.NotImplemented().into_ptr())
+        }
+
+        $crate::ffi::PyType_Slot {
+            slot: $crate::ffi::Py_nb_power,
+            pfunc: $crate::impl_::trampoline::get_trampoline_function!(ternaryfunc, slot_impl)
+                as $crate::ffi::ternaryfunc as _,
+        }
+    }};
+
+    // Only the reflected method is implemented on this class; the forward method
+    // must be resolved on the base class (if any).
+    ($cls:ty, false, true) => {{
+        unsafe fn slot_impl(
+            py: $crate::Python<'_>,
+            _slf: *mut $crate::ffi::PyObject,
+            _other: *mut $crate::ffi::PyObject,
+            _mod: *mut $crate::ffi::PyObject,
+        ) -> $crate::PyResult<*mut $crate::ffi::PyObject> {
+            use $crate::impl_::pyclass::*;
+            use $crate::types::PyAnyMethods;
+            let collector = PyClassImplCollector::<$cls>::new();
+
+            let lhs_obj = unsafe { $crate::Bound::from_borrowed_ptr(py, _slf) };
+            if lhs_obj.is_instance_of::<$cls>() {
+                // The forward operand is our class; let the base class handle the
+                // forward call (mirrors Python's method resolution).
+                let rhs_obj = unsafe { $crate::Bound::from_borrowed_ptr(py, _other) };
+                let mod_obj = if _mod.is_null() {
+                    py.None().into_bound(py)
+                } else {
+                    unsafe { $crate::Bound::from_borrowed_ptr(py, _mod) }
+                };
+                let result = $crate::impl_::pyclass::call_base_class_fragment(
+                    py,
+                    &<$cls as $crate::PyTypeInfo>::type_object(py),
+                    &lhs_obj,
+                    $crate::intern!(py, "__pow__"),
+                    &rhs_obj,
+                    ::core::option::Option::Some(&mod_obj),
+                )?;
+                if let ::core::option::Option::Some(result) = result {
+                    return ::core::result::Result::Ok(result);
+                }
+            }
+
+            let rhs_obj = unsafe { $crate::Bound::from_borrowed_ptr(py, _other) };
+            if rhs_obj.is_instance_of::<$cls>() {
+                return unsafe { collector.__rpow__(py, _other, _slf, _mod) };
+            }
+
+            ::core::result::Result::Ok(py.NotImplemented().into_ptr())
         }
 
         $crate::ffi::PyType_Slot {
@@ -937,6 +1151,43 @@ pub unsafe fn check_richcmp_arg_type<T: PyTypeCheck>(
         let _ = unsafe { obj.assume_borrowed(py) }.cast::<T>()?;
     }
     Ok(())
+}
+
+/// Calls a binary-operator dunder (e.g. `__add__`) on the base class of `ty`, with
+/// `receiver` as the bound instance, mirroring what
+/// `super(ty, receiver).<name>(*args)` does in Python.
+///
+/// This is used by the generated number slots when a class implements only one arm of
+/// a reversible binary operator, so that the other arm is resolved on the base class
+/// just like Python's method resolution would do for a plain Python subclass.
+///
+/// Returns `Ok(None)` if the base class does not implement the requested dunder, so
+/// that the caller can fall back to other options or return `NotImplemented`.
+pub fn call_base_class_fragment<'py>(
+    py: Python<'py>,
+    ty: &Bound<'py, PyType>,
+    receiver: &Bound<'py, PyAny>,
+    name: &Bound<'py, PyString>,
+    args: &Bound<'py, PyAny>,
+    mod_: Option<&Bound<'py, PyAny>>,
+) -> PyResult<Option<*mut ffi::PyObject>> {
+    let super_obj = PySuper::new(ty, receiver)?;
+    let call_result = match mod_ {
+        Some(mod_) => super_obj.call_method(name, (args, mod_), None),
+        None => super_obj.call_method1(name, (args,)),
+    };
+    match call_result {
+        Ok(result) => Ok(Some(result.into_ptr())),
+        Err(e) => {
+            // If the base class does not implement the method, treat it as not
+            // implemented rather than propagating the AttributeError.
+            if e.is_instance_of::<PyAttributeError>(py) {
+                Ok(None)
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 #[doc(hidden)]
