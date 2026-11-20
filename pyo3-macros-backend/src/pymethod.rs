@@ -723,13 +723,13 @@ pub fn impl_py_setter_def(
             },
             ..
         } => {
-            format_ident!("__pymethod_set_{}__", ident)
+            format_ident!("__setter_pymethod_{}__", ident)
         }
         PropertyType::Descriptor { field_index, .. } => {
-            format_ident!("__pymethod_set_field_{}__", field_index)
+            format_ident!("__setter_pymethod_field_{}__", field_index)
         }
         PropertyType::Function { spec, .. } => {
-            format_ident!("__pymethod_set_{}__", spec.name)
+            format_ident!("__setter_pymethod_{}__", spec.name)
         }
     };
 
@@ -936,7 +936,7 @@ pub fn impl_py_getter_def(
         PropertyType::Function {
             spec, self_type, ..
         } => {
-            let wrapper_ident = format_ident!("__pymethod_get_{}__", spec.name);
+            let wrapper_ident = format_ident!("__getter_pymethod_{}__", spec.name);
             let call = impl_call_getter(cls, spec, self_type, &mut holders, ctx)?;
             let body = quote! {
                 #pyo3_path::impl_::callback::convert(py, #call)
@@ -989,7 +989,7 @@ pub fn impl_py_deleter_def(
     let python_name = spec.null_terminated_python_name();
     let mut holders = Holders::new();
     let deleter_impl = impl_call_deleter(cls, spec, self_type, &mut holders, ctx)?;
-    let wrapper_ident = format_ident!("__pymethod_delete_{}__", spec.name);
+    let wrapper_ident = format_ident!("__deleter_pymethod_{}__", spec.name);
     let warnings = spec.warnings.build_py_warning(ctx);
     let init_holders = holders.init_holders(ctx);
     let doc = doc_to_optional_cstr(doc.as_ref(), ctx)?;

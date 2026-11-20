@@ -354,3 +354,94 @@ fn test_unit_getter() {
         py_run!(py, instance, "assert instance.value is ()");
     })
 }
+
+// Regression test for #5974: a `#[getter]` on `x` and a regular method `get_x` used to
+// generate the same internal wrapper (`__pymethod_get_x__`), which was a compile error.
+// The same applied to `#[setter]`/`#[deleter]` and to `#[pyo3(name = ...)]` renames which
+// happen to start with `get_`, `set_` or `delete_`. Property wrappers now use their own
+// prefixes, so no Python name can collide with them.
+#[pyclass]
+struct PropertyAndMethodWithSharedPrefix {
+    x: u32,
+    y: u32,
+    z: u32,
+    w: Option<u32>,
+}
+
+#[pymethods]
+impl PropertyAndMethodWithSharedPrefix {
+    #[getter]
+    fn x(&self) -> u32 {
+        self.x
+    }
+
+    fn get_x(&self) -> u32 {
+        self.x + 1
+    }
+
+    #[getter]
+    fn y(&self) -> u32 {
+        self.y
+    }
+
+    #[pyo3(name = "get_y")]
+    fn y_get(&self) -> u32 {
+        self.y + 2
+    }
+
+    #[setter]
+    fn z(&mut self, value: u32) {
+        self.z = value;
+    }
+
+    fn set_z(&mut self, value: u32) {
+        self.z = value + 1;
+    }
+
+    #[getter]
+    fn get_w(&self) -> Option<u32> {
+        self.w
+    }
+
+    #[deleter]
+    fn w(&mut self) {
+        self.w = None;
+    }
+
+    fn delete_w(&mut self) {
+        self.w = Some(0);
+    }
+}
+
+#[test]
+fn property_and_regular_method_with_shared_prefix() {
+    Python::attach(|py| {
+        let instance = Py::new(
+            py,
+            PropertyAndMethodWithSharedPrefix {
+                x: 10,
+                y: 20,
+                z: 30,
+                w: Some(40),
+            },
+        )
+        .unwrap();
+
+        py_assert!(py, instance, "instance.x == 10");
+        py_assert!(py, instance, "instance.get_x() == 11");
+        py_assert!(py, instance, "instance.y == 20");
+        py_assert!(py, instance, "instance.get_y() == 22");
+
+        // The property setter writes the value unchanged, the method increments it.
+        py_run!(py, instance, "instance.z = 5");
+        assert_eq!(instance.borrow(py).z, 5);
+        py_run!(py, instance, "instance.set_z(5)");
+        assert_eq!(instance.borrow(py).z, 6);
+
+        // The property deleter clears the field, the method sets it to zero.
+        py_run!(py, instance, "del instance.w");
+        assert_eq!(instance.borrow(py).w, None);
+        py_run!(py, instance, "instance.delete_w()");
+        assert_eq!(instance.borrow(py).w, Some(0));
+    })
+}
