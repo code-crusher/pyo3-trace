@@ -463,3 +463,187 @@ fn complex_enum_renamed_variant_qualname() {
         py_assert!(py, cls, "cls.B.__qualname__ == 'ComplexEnum.B'");
     });
 }
+
+// Manual equivalent of the variant classes which `#[pyclass]` generates for a
+// complex enum, for the case where the enum comes from another crate and so
+// cannot be annotated directly. See the "Emulating variant classes for external
+// enums" section of the guide.
+mod external_enum {
+    use super::*;
+    use pyo3::types::{PyTuple, PyType};
+
+    #[derive(Debug, PartialEq)]
+    pub enum ExternalShape {
+        Circle { radius: f64 },
+        Rectangle { width: f64, height: f64 },
+    }
+
+    #[pyclass(subclass, name = "ExternalShape")]
+    pub struct PyExternalShape(pub ExternalShape);
+
+    #[pymethods]
+    impl PyExternalShape {
+        #[classattr]
+        #[allow(non_snake_case)]
+        fn Circle(py: Python<'_>) -> Bound<'_, PyType> {
+            py.get_type::<PyExternalShapeCircle>()
+        }
+
+        #[classattr]
+        #[allow(non_snake_case)]
+        fn Rectangle(py: Python<'_>) -> Bound<'_, PyType> {
+            py.get_type::<PyExternalShapeRectangle>()
+        }
+    }
+
+    impl PyExternalShape {
+        pub fn from_shape(shape: ExternalShape, py: Python<'_>) -> PyResult<Py<PyExternalShape>> {
+            let value = match shape {
+                ExternalShape::Circle { radius } => Py::new(
+                    py,
+                    PyClassInitializer::from(PyExternalShape(ExternalShape::Circle { radius }))
+                        .add_subclass(PyExternalShapeCircle),
+                )?
+                .into_any(),
+                ExternalShape::Rectangle { width, height } => Py::new(
+                    py,
+                    PyClassInitializer::from(PyExternalShape(ExternalShape::Rectangle {
+                        width,
+                        height,
+                    }))
+                    .add_subclass(PyExternalShapeRectangle),
+                )?
+                .into_any(),
+            };
+            Ok(value
+                .into_bound(py)
+                .cast_into::<PyExternalShape>()?
+                .unbind())
+        }
+    }
+
+    #[pyclass(extends = PyExternalShape, name = "ExternalShapeCircle")]
+    pub struct PyExternalShapeCircle;
+
+    #[pymethods]
+    impl PyExternalShapeCircle {
+        #[new]
+        fn new(radius: f64) -> PyClassInitializer<Self> {
+            PyClassInitializer::from(PyExternalShape(ExternalShape::Circle { radius }))
+                .add_subclass(Self)
+        }
+
+        #[classattr]
+        fn __match_args__(py: Python<'_>) -> PyResult<Bound<'_, PyTuple>> {
+            PyTuple::new(py, ["radius"])
+        }
+
+        #[getter]
+        fn radius(self_: PyRef<'_, Self>) -> f64 {
+            match self_.as_ref().0 {
+                ExternalShape::Circle { radius } => radius,
+                _ => unreachable!("wrong variant"),
+            }
+        }
+    }
+
+    #[pyclass(extends = PyExternalShape, name = "ExternalShapeRectangle")]
+    pub struct PyExternalShapeRectangle;
+
+    #[pymethods]
+    impl PyExternalShapeRectangle {
+        #[new]
+        fn new(width: f64, height: f64) -> PyClassInitializer<Self> {
+            PyClassInitializer::from(PyExternalShape(ExternalShape::Rectangle { width, height }))
+                .add_subclass(Self)
+        }
+
+        #[classattr]
+        fn __match_args__(py: Python<'_>) -> PyResult<Bound<'_, PyTuple>> {
+            PyTuple::new(py, ["width", "height"])
+        }
+
+        #[getter]
+        fn width(self_: PyRef<'_, Self>) -> f64 {
+            match self_.as_ref().0 {
+                ExternalShape::Rectangle { width, .. } => width,
+                _ => unreachable!("wrong variant"),
+            }
+        }
+
+        #[getter]
+        fn height(self_: PyRef<'_, Self>) -> f64 {
+            match self_.as_ref().0 {
+                ExternalShape::Rectangle { height, .. } => height,
+                _ => unreachable!("wrong variant"),
+            }
+        }
+    }
+}
+
+#[test]
+fn external_enum_variant_classes() {
+    use external_enum::*;
+
+    Python::attach(|py| {
+        let cls = py.get_type::<PyExternalShape>();
+        py_run!(
+            py,
+            cls,
+            r#"
+            circle = cls.Circle(10.0)
+            assert isinstance(circle, cls)
+            assert isinstance(circle, cls.Circle)
+            assert not isinstance(circle, cls.Rectangle)
+            assert circle.radius == 10.0
+
+            square = cls.Rectangle(width=1.0, height=1.0)
+            assert isinstance(square, cls.Rectangle)
+            assert not isinstance(square, cls.Circle)
+            assert square.width == 1.0
+            assert square.height == 1.0
+        "#
+        );
+    });
+}
+
+#[test]
+#[cfg(Py_3_10)]
+fn external_enum_variant_classes_pattern_match() {
+    use external_enum::*;
+
+    Python::attach(|py| {
+        let cls = py.get_type::<PyExternalShape>();
+        py_run!(
+            py,
+            cls,
+            r#"
+            def describe(cls, shape):
+                match shape:
+                    case cls.Circle(radius):
+                        return ('circle', radius)
+                    case cls.Rectangle(width, height):
+                        return ('rectangle', width, height)
+
+            assert describe(cls, cls.Circle(10.0)) == ('circle', 10.0)
+            assert describe(cls, cls.Rectangle(width=1.0, height=2.0)) == ('rectangle', 1.0, 2.0)
+        "#
+        );
+    });
+}
+
+#[test]
+fn external_enum_variant_classes_from_rust() {
+    use external_enum::*;
+
+    Python::attach(|py| {
+        let circle =
+            PyExternalShape::from_shape(ExternalShape::Circle { radius: 2.0 }, py).unwrap();
+        let circle_cls = py.get_type::<PyExternalShapeCircle>();
+        assert!(circle.bind(py).is_instance(&circle_cls).unwrap());
+        // The base class is still reachable through the variant class
+        let base: PyRef<'_, PyExternalShape> =
+            circle.bind(py).cast::<PyExternalShape>().unwrap().borrow();
+        assert_eq!(base.0, ExternalShape::Circle { radius: 2.0 });
+    });
+}
