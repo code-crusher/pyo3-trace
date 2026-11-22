@@ -90,7 +90,7 @@ where
 
 // TODO: use `core::array::try_from_fn`, if that stabilises:
 // https://github.com/rust-lang/rust/issues/89379
-fn array_try_from_fn<E, F, T, const N: usize>(mut cb: F) -> Result<[T; N], E>
+pub(crate) fn array_try_from_fn<E, F, T, const N: usize>(mut cb: F) -> Result<[T; N], E>
 where
     F: FnMut(usize) -> Result<T, E>,
 {

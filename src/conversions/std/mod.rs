@@ -1,4 +1,5 @@
 mod array;
+pub(crate) use array::array_try_from_fn;
 mod cell;
 mod cstring;
 mod ipaddr;

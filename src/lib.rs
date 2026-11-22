@@ -356,6 +356,7 @@ pub use crate::pyclass::{PyClass, PyClassGuard, PyClassGuardMut};
 pub use crate::pyclass_init::PyClassInitializer;
 pub use crate::type_object::{PyTypeCheck, PyTypeInfo};
 pub use crate::types::PyAny;
+pub use crate::unpack::Unpackable;
 pub use crate::version::PythonVersionInfo;
 
 pub(crate) mod ffi_ptr_ext;
@@ -443,6 +444,7 @@ pub mod pyclass_init;
 
 pub mod type_object;
 pub mod types;
+mod unpack;
 mod version;
 
 #[allow(

@@ -26,6 +26,33 @@ This method is available for many Python object types, and can produce a wide va
 There, in order to both be able to operate on mutable references *and* satisfy Rust's rules of non-aliasing mutable references, you have to extract the PyO3 reference wrappers [`PyRef`] and [`PyRefMut`].
 They work like the reference wrappers of `std::cell::RefCell` and ensure (at runtime) that Rust borrows are allowed.
 
+### Unpacking with `.unpack()` and the `Unpackable` trait
+
+Extracting a Rust tuple requires the Python object to be a `tuple`.
+To mirror Python's unpacking syntax (`a, b, c = obj`), which accepts any iterable, use `.unpack()` instead:
+
+```rust
+# use pyo3::prelude::*;
+# use pyo3::types::PyList;
+# fn main() -> PyResult<()> {
+#     Python::attach(|py| {
+let list = PyList::new(py, [1, 2, 3])?;
+
+// Rust destructuring mirrors Python's `a, b, c = list`
+let (a, b, c): (i32, i32, i32) = list.unpack()?;
+assert_eq!((a, b, c), (1, 2, 3));
+
+// ... and arrays work too
+let array: [i32; 3] = list.unpack()?;
+assert_eq!(array, [1, 2, 3]);
+#         Ok(())
+#     })
+# }
+```
+
+[`Unpackable`] is implemented for tuples of up to 12 elements and for arrays of any length.
+Unlike [`FromPyObject`], it cannot extract element types which borrow from the Python object, because each element is extracted from a temporary reference produced while iterating.
+
 ### Deriving [`FromPyObject`]
 
 [`FromPyObject`] can be automatically derived for many kinds of structs and enums if the member types themselves implement `FromPyObject`.
@@ -770,6 +797,7 @@ In the example above we used `BoundObject::into_any` and `BoundObject::unbind` t
 [`FromPyObject`]: {{#PYO3_DOCS_URL}}/pyo3/conversion/trait.FromPyObject.html
 [`IntoPyObject`]: {{#PYO3_DOCS_URL}}/pyo3/conversion/trait.IntoPyObject.html
 [`IntoPyObjectExt`]: {{#PYO3_DOCS_URL}}/pyo3/conversion/trait.IntoPyObjectExt.html
+[`Unpackable`]: {{#PYO3_DOCS_URL}}/pyo3/trait.Unpackable.html
 
 [`PyRef`]: {{#PYO3_DOCS_URL}}/pyo3/pycell/struct.PyRef.html
 [`PyRefMut`]: {{#PYO3_DOCS_URL}}/pyo3/pycell/struct.PyRefMut.html

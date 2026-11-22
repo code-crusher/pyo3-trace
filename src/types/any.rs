@@ -755,6 +755,38 @@ pub trait PyAnyMethods<'py>: crate::sealed::Sealed {
     where
         T: FromPyObject<'a, 'py>;
 
+    /// Unpacks the Python object into a Rust tuple or array.
+    ///
+    /// This mirrors Python's unpacking syntax, e.g. `a, b, c = obj`, and therefore works for any
+    /// iterable object rather than only for [`PyTuple`][crate::types::PyTuple]. Note that
+    /// [`extract`][Self::extract] is stricter: it requires the object to be a tuple, and also
+    /// supports element types which borrow from it.
+    ///
+    /// An error is raised if the object is not iterable, or if the number of values it yields
+    /// does not match the length of the tuple or array being unpacked into.
+    ///
+    /// # Example
+    /// ```
+    /// use pyo3::prelude::*;
+    /// use pyo3::types::PyList;
+    ///
+    /// # fn main() -> PyResult<()> {
+    /// Python::attach(|py| {
+    ///     let list = PyList::new(py, [1, 2, 3])?;
+    ///
+    ///     let (a, b, c): (i32, i32, i32) = list.unpack()?;
+    ///     assert_eq!((a, b, c), (1, 2, 3));
+    ///
+    ///     let array: [i32; 3] = list.unpack()?;
+    ///     assert_eq!(array, [1, 2, 3]);
+    ///     Ok(())
+    /// })
+    /// # }
+    /// ```
+    fn unpack<T>(&self) -> PyResult<T>
+    where
+        T: crate::Unpackable<'py>;
+
     /// Returns the reference count for the Python object.
     #[deprecated(
         since = "0.29.0",
@@ -1209,6 +1241,13 @@ impl<'py> PyAnyMethods<'py> for Bound<'py, PyAny> {
         T: FromPyObject<'a, 'py>,
     {
         FromPyObject::extract(self.as_borrowed())
+    }
+
+    fn unpack<T>(&self) -> PyResult<T>
+    where
+        T: crate::Unpackable<'py>,
+    {
+        T::unpack(self.as_borrowed())
     }
 
     fn get_refcnt(&self) -> isize {
